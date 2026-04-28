@@ -1,0 +1,9 @@
+IN'S mercato
+DOCUMENTO COMMERCIALE
+Descrizione      IVA   Prezzo(EUR)
+PANE             A      1,20
+LATTE            A      1,45
+TOTALE COMPLESSIVO EUR 4.16
+PAGAMENTO ELETTRONICO 4,16
+16.04.26 18:34
+

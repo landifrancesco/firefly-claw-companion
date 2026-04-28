@@ -1,0 +1,29 @@
+defaults:
+  expense_source_account: Main Checking
+  expense_destination_account: Misc Expenses
+  income_source_account: Income Source
+  income_destination_account: Main Checking
+
+account_aliases:
+  checking: Main Checking
+  emergency_fund: Savings
+
+category_aliases:
+  groceries: Groceries
+  rent: Housing
+  salary: Salary
+
+budget_aliases:
+  groceries: Groceries
+  household: Household
+
+merchant_rules:
+  coop:
+    destination_account: Coop
+    category: Groceries
+  landlord:
+    destination_account: Landlord
+    category: Housing
+  employer:
+    source_account: Employer
+    category: Salary

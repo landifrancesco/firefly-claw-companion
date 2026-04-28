@@ -1,0 +1,5 @@
+input: "quali sono le categorie di marzo 2026"
+expected_intent: "top_spending_categories"
+expected_period:
+  month: "2026-03"
+

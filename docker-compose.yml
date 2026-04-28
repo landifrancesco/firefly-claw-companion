@@ -1,0 +1,90 @@
+services:
+  companion:
+    build:
+      context: .
+      args:
+        OPENCLAW_IMAGE: ${OPENCLAW_IMAGE:-ghcr.io/openclaw/openclaw:latest}
+    image: ${COMPOSE_IMAGE_NAME:-firefly-openclaw-companion:local}
+    container_name: ${COMPOSE_PROJECT_NAME:-firefly-openclaw-companion}
+    restart: unless-stopped
+    environment:
+      TZ: ${TZ:-Europe/Rome}
+      OPENCLAW_PORT: ${OPENCLAW_PORT:-18789}
+      OPENCLAW_BIND: ${OPENCLAW_BIND:-loopback}
+      OPENCLAW_DEFAULT_MODEL: ${OPENCLAW_DEFAULT_MODEL:-openai/gpt-5.4-mini}
+      OPENCLAW_HOME: /home/openclaw
+      OPENCLAW_WORKSPACE: /home/openclaw/workspace
+      FIREFLY_BASE_URL: ${FIREFLY_BASE_URL:-http://firefly:8080}
+      FIREFLY_API_BASE_PATH: ${FIREFLY_API_BASE_PATH:-/api/v1}
+      FIREFLY_TIMEOUT_SECONDS: ${FIREFLY_TIMEOUT_SECONDS:-15}
+      FIREFLY_VERIFY_TLS: ${FIREFLY_VERIFY_TLS:-true}
+      FIREFLY_DEFAULT_DRY_RUN: ${FIREFLY_DEFAULT_DRY_RUN:-true}
+      FIREFLY_HIGH_VALUE_THRESHOLD: ${FIREFLY_HIGH_VALUE_THRESHOLD:-250.00}
+      FIREFLY_DEDUPE_WINDOW_DAYS: ${FIREFLY_DEDUPE_WINDOW_DAYS:-7}
+      FIREFLY_ALLOW_DELETE: ${FIREFLY_ALLOW_DELETE:-false}
+      FIREFLY_RUNTIME_VERIFY_ON_BOOT: ${FIREFLY_RUNTIME_VERIFY_ON_BOOT:-true}
+      FIREFLY_ACCESS_TOKEN_EXPIRES_ON: ${FIREFLY_ACCESS_TOKEN_EXPIRES_ON:-}
+      FIREFLY_TOKEN_REMINDER_DAYS: ${FIREFLY_TOKEN_REMINDER_DAYS:-60,30,14,7,3,1}
+      FIREFLY_TOKEN_REMINDER_CHECK_INTERVAL_SECONDS: ${FIREFLY_TOKEN_REMINDER_CHECK_INTERVAL_SECONDS:-21600}
+      FIREFLY_MAPPINGS_PATH: ${FIREFLY_MAPPINGS_PATH:-/home/openclaw/workspace/config/mappings.yml}
+      FIREFLY_POLICY_PATH: ${FIREFLY_POLICY_PATH:-/home/openclaw/workspace/config/policy.yml}
+      TELEGRAM_ENABLED: ${TELEGRAM_ENABLED:-true}
+      TELEGRAM_OWNER_ID: ${TELEGRAM_OWNER_ID:-}
+      TELEGRAM_TARGET_ID: ${TELEGRAM_TARGET_ID:-}
+      TELEGRAM_DM_POLICY: ${TELEGRAM_DM_POLICY:-allowlist}
+      FIREFLY_CHAT_LANGUAGE: ${FIREFLY_CHAT_LANGUAGE:-auto}
+      FIREFLY_RECEIPT_AI_OCR: ${FIREFLY_RECEIPT_AI_OCR:-true}
+      FIREFLY_PDF_OCR_PROVIDER_ENABLED: ${FIREFLY_PDF_OCR_PROVIDER_ENABLED:-true}
+      PDFAPIHUB_API_KEY: ${PDFAPIHUB_API_KEY:-}
+      PDFAPIHUB_BASE_URL: ${PDFAPIHUB_BASE_URL:-https://pdfapihub.com/api}
+      FIREFLY_PDF_OCR_LANG: ${FIREFLY_PDF_OCR_LANG:-ita+eng}
+      OPENCLAW_TELEGRAM_CHANNEL_ENABLED: ${OPENCLAW_TELEGRAM_CHANNEL_ENABLED:-false}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_API_KEYS: ${OPENAI_API_KEYS:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      GOOGLE_API_KEY: ${GOOGLE_API_KEY:-}
+      AI_GATEWAY_API_KEY: ${AI_GATEWAY_API_KEY:-}
+    volumes:
+      - openclaw_home:/home/openclaw/.openclaw
+      - openclaw_workspace:/home/openclaw/workspace
+      - ./secrets:/run/host-secrets:ro
+    networks:
+      - firefly_net
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/firefly-openclaw/bin/verify_setup.sh --runtime"]
+      interval: ${OPENCLAW_HEALTHCHECK_INTERVAL:-30s}
+      timeout: ${OPENCLAW_HEALTHCHECK_TIMEOUT:-15s}
+      retries: ${OPENCLAW_HEALTHCHECK_RETRIES:-8}
+      start_period: ${OPENCLAW_HEALTHCHECK_START_PERIOD:-120s}
+
+  setup:
+    build:
+      context: .
+      args:
+        OPENCLAW_IMAGE: ${OPENCLAW_IMAGE:-ghcr.io/openclaw/openclaw:latest}
+    image: ${COMPOSE_IMAGE_NAME:-firefly-openclaw-companion:local}
+    profiles: ["setup"]
+    stdin_open: true
+    tty: true
+    environment:
+      TZ: ${TZ:-Europe/Rome}
+      OPENCLAW_HOME: /home/openclaw
+      OPENCLAW_WORKSPACE: /home/openclaw/workspace
+      SETUP_HOST_ROOT: /host-repo
+    volumes:
+      - openclaw_home:/home/openclaw/.openclaw
+      - openclaw_workspace:/home/openclaw/workspace
+      - .:/host-repo
+    networks:
+      - firefly_net
+    entrypoint: ["python3", "/opt/firefly-openclaw/bin/setup_wizard.py"]
+
+networks:
+  firefly_net:
+    name: ${FIREFLY_DOCKER_NETWORK:-firefly}
+    external: ${FIREFLY_DOCKER_NETWORK_EXTERNAL:-false}
+
+volumes:
+  openclaw_home:
+  openclaw_workspace:

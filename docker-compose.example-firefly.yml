@@ -1,0 +1,60 @@
+version: "3.9"
+
+services:
+  firefly-db:
+    image: mariadb:11
+    container_name: firefly-example-db
+    profiles: ["example-firefly"]
+    restart: unless-stopped
+    environment:
+      MYSQL_RANDOM_ROOT_PASSWORD: "yes"
+      MYSQL_DATABASE: ${EXAMPLE_FIREFLY_DB_NAME:-firefly}
+      MYSQL_USER: ${EXAMPLE_FIREFLY_DB_USER:-firefly}
+      MYSQL_PASSWORD: ${EXAMPLE_FIREFLY_DB_PASSWORD:-firefly-change-me}
+    volumes:
+      - firefly_db_data:/var/lib/mysql
+    networks:
+      - firefly_net
+    healthcheck:
+      test: ["CMD-SHELL", "mariadb-admin ping -h 127.0.0.1 -u${EXAMPLE_FIREFLY_DB_USER:-firefly} -p${EXAMPLE_FIREFLY_DB_PASSWORD:-firefly-change-me} --silent"]
+      interval: 20s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+
+  firefly:
+    image: fireflyiii/core:latest
+    container_name: firefly-example
+    profiles: ["example-firefly"]
+    restart: unless-stopped
+    depends_on:
+      firefly-db:
+        condition: service_healthy
+    environment:
+      APP_ENV: local
+      APP_KEY: ${EXAMPLE_FIREFLY_APP_KEY:-base64:ChangeMeChangeMeChangeMeChangeMeChangeMe=}
+      SITE_OWNER: ${EXAMPLE_FIREFLY_SITE_OWNER:-owner@example.test}
+      TZ: ${TZ:-Europe/Rome}
+      DB_CONNECTION: mysql
+      DB_HOST: firefly-db
+      DB_PORT: 3306
+      DB_DATABASE: ${EXAMPLE_FIREFLY_DB_NAME:-firefly}
+      DB_USERNAME: ${EXAMPLE_FIREFLY_DB_USER:-firefly}
+      DB_PASSWORD: ${EXAMPLE_FIREFLY_DB_PASSWORD:-firefly-change-me}
+      TRUSTED_PROXIES: "**"
+      APP_URL: ${EXAMPLE_FIREFLY_APP_URL:-http://localhost:8080}
+    ports:
+      - "127.0.0.1:${EXAMPLE_FIREFLY_HOST_PORT:-8080}:8080"
+    volumes:
+      - firefly_upload_data:/var/www/html/storage/upload
+    networks:
+      - firefly_net
+
+networks:
+  firefly_net:
+    name: ${FIREFLY_DOCKER_NETWORK:-firefly}
+    external: false
+
+volumes:
+  firefly_db_data:
+  firefly_upload_data:

@@ -1,0 +1,20 @@
+security:
+  browser_enabled: false
+  verify_tls: true
+  localhost_only_exposure: true
+  gateway_token_required: true
+
+writes:
+  default_dry_run: true
+  high_value_threshold: "250.00"
+  dedupe_window_days: 7
+  require_high_value_confirmation: true
+  allow_delete: false
+
+timeouts:
+  request_seconds: 15
+
+behavior:
+  prefer_rest_bridge: true
+  invent_missing_names: false
+  allow_bulk_edits: false

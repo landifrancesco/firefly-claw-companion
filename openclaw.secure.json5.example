@@ -1,0 +1,43 @@
+{
+  // Static, non-secret base config. Runtime bootstrap writes
+  // openclaw.runtime.json5 with secrets and current environment values.
+  gateway: {
+    mode: "local",
+    bind: "loopback",
+    port: 18789,
+    controlUi: {
+      enabled: false,
+    },
+  },
+  plugins: {
+    entries: {
+      bonjour: {
+        enabled: false,
+      },
+    },
+  },
+  tools: {
+    deny: ["browser", "canvas", "nodes", "cron"],
+    allow: ["gateway"],
+  },
+  browser: {
+    enabled: false,
+  },
+  agents: {
+    defaults: {
+      workspace: "/home/openclaw/workspace",
+    },
+  },
+  skills: {
+    load: {
+      watch: false,
+    },
+  },
+  logging: {
+    level: "info",
+    consoleLevel: "info",
+    consoleStyle: "compact",
+    redactSensitive: "tools",
+    file: "/home/openclaw/workspace/logs/openclaw.log",
+  },
+}
