@@ -3,33 +3,32 @@ set -euo pipefail
 
 umask 027
 
-SOURCE_ROOT="${1:-/opt/firefly-openclaw/workspace}"
-TARGET_ROOT="${2:-${OPENCLAW_WORKSPACE:-$HOME/workspace}}"
+SOURCE_ROOT="${1:-/opt/firefly-picoclaw/workspace}"
+TARGET_ROOT="${2:-${PICOCLAW_WORKSPACE:-$HOME/.picoclaw/workspace}}"
 
-mkdir -p "${TARGET_ROOT}"
+mkdir -p "${TARGET_ROOT}/config" "${TARGET_ROOT}/tools" "${TARGET_ROOT}/i18n" "${TARGET_ROOT}/logs"
 
 if [[ ! -d "${SOURCE_ROOT}" ]]; then
   echo "Bundle source does not exist: ${SOURCE_ROOT}" >&2
   exit 1
 fi
 
-find "${SOURCE_ROOT}" -type d -print | while IFS= read -r dir; do
-  relative="${dir#${SOURCE_ROOT}}"
-  mkdir -p "${TARGET_ROOT}${relative}"
-done
-
-find "${SOURCE_ROOT}" -type f -print | while IFS= read -r file; do
-  relative="${file#${SOURCE_ROOT}/}"
-  destination="${TARGET_ROOT}/${relative}"
-  if [[ ! -e "${destination}" ]]; then
-    install -m 0640 "${file}" "${destination}"
+copy_if_absent() {
+  local source="$1"
+  local destination="$2"
+  if [[ -f "${source}" && ! -e "${destination}" ]]; then
+    install -m 0640 "${source}" "${destination}"
   fi
-done
+}
 
-find "${TARGET_ROOT}/tools" -maxdepth 1 -type f -print 2>/dev/null | while IFS= read -r tool_file; do
-  chmod 0750 "${tool_file}"
-done
+copy_if_absent "${SOURCE_ROOT}/config/mappings.yml.example" "${TARGET_ROOT}/config/mappings.yml"
+copy_if_absent "${SOURCE_ROOT}/config/policy.yml" "${TARGET_ROOT}/config/policy.yml"
+copy_if_absent "${SOURCE_ROOT}/config/policy.yml.example" "${TARGET_ROOT}/config/policy.yml.example"
+copy_if_absent "${SOURCE_ROOT}/i18n/telegram_bot.en.json" "${TARGET_ROOT}/i18n/telegram_bot.en.json"
+copy_if_absent "${SOURCE_ROOT}/i18n/telegram_bot.it.json" "${TARGET_ROOT}/i18n/telegram_bot.it.json"
 
-if [[ -d "${TARGET_ROOT}/logs" ]]; then
-  chmod 0750 "${TARGET_ROOT}/logs"
+if [[ -f "${SOURCE_ROOT}/tools/firefly-bridge" ]]; then
+  install -m 0750 "${SOURCE_ROOT}/tools/firefly-bridge" "${TARGET_ROOT}/tools/firefly-bridge"
 fi
+
+chmod 0750 "${TARGET_ROOT}/logs"

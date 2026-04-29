@@ -13,7 +13,7 @@
     "commands_natural_hint": "Send help if you want natural-language examples instead.",
     "startup_ok": "Firefly bridge is healthy. Bot ready. /help shows what you can ask.",
     "startup_warn": "Firefly bridge started with a warning. /help shows what you can ask.",
-    "startup_gateway_unhealthy": "I started, but the OpenClaw gateway is still not healthy on localhost:18789. Check docker compose logs.",
+    "startup_gateway_unhealthy": "I started, but the PicoClaw gateway is still not healthy on localhost:18790. Check docker compose logs.",
     "need_more_detail": "I need a bit more detail to do that safely.",
     "no_pending_draft": "There is no pending draft to commit.",
     "receipt_unreadable": "I could not read that receipt safely yet. Send a short note with the image, for example 'receipt for coffee paid with cash', or type the expense normally.",
@@ -38,6 +38,7 @@
     "command_lines": [
       "/help - natural-language examples",
       "/commands - this command list",
+      "/train - teach account defaults and payment aliases like card/cash",
       "/setup - account and budget profile; accepts status or reset",
       "/add - guided transaction entry",
       "/balances - account balances",

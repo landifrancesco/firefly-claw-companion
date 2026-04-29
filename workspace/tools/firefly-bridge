@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+if [[ "$#" -eq 0 ]]; then
+  exec python3 -m firefly_companion.mcp_server
+fi
+
 exec python3 -m firefly_companion.cli "$@"

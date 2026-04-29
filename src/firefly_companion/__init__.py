@@ -1,4 +1,4 @@
-"""Firefly III companion bridge for OpenClaw."""
+"""Firefly III companion bridge for PicoClaw."""
 
 __all__ = ["__version__"]
 

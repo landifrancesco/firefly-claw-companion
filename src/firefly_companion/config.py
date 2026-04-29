@@ -42,7 +42,7 @@ class BridgeSettings:
     allow_delete: bool = False
     mappings_path: Path = field(default_factory=lambda: Path("workspace/config/mappings.yml"))
     policy_path: Path = field(default_factory=lambda: Path("workspace/config/policy.yml"))
-    runtime_env_path: Path = field(default_factory=lambda: Path.home() / ".openclaw" / "firefly-bridge.env")
+    runtime_env_path: Path = field(default_factory=lambda: Path.home() / ".picoclaw" / "firefly-bridge.env")
     mappings: dict[str, Any] = field(default_factory=dict)
     policy: dict[str, Any] = field(default_factory=dict)
 
@@ -64,7 +64,7 @@ class BridgeSettings:
 
     @classmethod
     def from_env(cls) -> "BridgeSettings":
-        runtime_env = Path(os.getenv("FIREFLY_RUNTIME_ENV_FILE", Path.home() / ".openclaw" / "firefly-bridge.env"))
+        runtime_env = Path(os.getenv("FIREFLY_RUNTIME_ENV_FILE", Path.home() / ".picoclaw" / "firefly-bridge.env"))
         if runtime_env.exists():
             for line in runtime_env.read_text(encoding="utf-8").splitlines():
                 stripped = line.strip()
@@ -76,10 +76,15 @@ class BridgeSettings:
         base_url = os.getenv("FIREFLY_BASE_URL", "http://firefly:8080")
         api_base_path = os.getenv("FIREFLY_API_BASE_PATH", "/api/v1")
         access_token = os.getenv("FIREFLY_ACCESS_TOKEN", "")
+        token_file = os.getenv("FIREFLY_ACCESS_TOKEN_FILE", "").strip()
+        if not access_token and token_file:
+            token_path = Path(token_file)
+            if token_path.exists():
+                access_token = token_path.read_text(encoding="utf-8").strip()
         if not access_token:
-            raise ConfigurationError("FIREFLY_ACCESS_TOKEN is required.")
+            raise ConfigurationError("FIREFLY_ACCESS_TOKEN or FIREFLY_ACCESS_TOKEN_FILE is required.")
 
-        workspace_root = Path(os.getenv("OPENCLAW_WORKSPACE", "workspace"))
+        workspace_root = Path(os.getenv("PICOCLAW_WORKSPACE", "workspace"))
         mappings_path = Path(os.getenv("FIREFLY_MAPPINGS_PATH", str(workspace_root / "config" / "mappings.yml")))
         policy_path = Path(os.getenv("FIREFLY_POLICY_PATH", str(workspace_root / "config" / "policy.yml")))
         mappings = _load_yaml(mappings_path)

@@ -10,7 +10,7 @@ import time
 import requests
 
 
-STATE_PATH = Path(os.getenv("FIREFLY_TOKEN_REMINDER_STATE_PATH", Path.home() / ".openclaw" / "token-reminder-state.json"))
+STATE_PATH = Path(os.getenv("FIREFLY_TOKEN_REMINDER_STATE_PATH", Path.home() / ".picoclaw" / "token-reminder-state.json"))
 
 
 def env_bool(name: str, default: bool) -> bool:

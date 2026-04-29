@@ -12,6 +12,7 @@ import json
 import time
 from collections import deque
 from dataclasses import dataclass, field
+from decimal import Decimal
 from typing import Any
 
 from firefly_companion.conversation import ConversationContext, localize
@@ -522,11 +523,12 @@ class DraftManager:
             if session.is_batch:
                 lines.append(f"\n{'-' * 20} #{i + 1}")
             kind_label = _type_label(draft.type, ctx)
-            lines.append(f"  {ctx.localized(en='Type', it='Tipo')}: {kind_label}")
+            lines.append(f"  {ctx.localized(en='Transaction', it='Movimento')}: {kind_label}")
             try:
                 amt_str = f"€{float(draft.amount.replace(',', '.')):.2f}"
             except (ValueError, TypeError):
                 amt_str = draft.amount
+            amt_str = _format_money(draft.amount)
             lines.append(f"  {ctx.localized(en='Amount', it='Importo')}: {amt_str}")
             desc = draft.description or "—"
             lines.append(f"  {ctx.localized(en='Description', it='Descrizione')}: {desc}")
@@ -836,8 +838,19 @@ def user_input_title_case(text: str) -> str:
 def _type_label(transaction_type: str, ctx: ConversationContext) -> str:
     """Localized label for a transaction type."""
     labels = {
-        "withdrawal": ctx.localized(en="Expense", it="Spesa"),
-        "deposit": ctx.localized(en="Income", it="Entrata"),
+        "withdrawal": ctx.localized(en="Expense (money out)", it="Spesa (soldi in uscita)"),
+        "deposit": ctx.localized(en="Income (money in)", it="Entrata (soldi in entrata)"),
         "transfer": ctx.localized(en="Transfer", it="Trasferimento"),
     }
     return labels.get(transaction_type, transaction_type)
+
+
+def _format_money(value: Any) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return "EUR ?"
+    try:
+        amount = Decimal(raw.replace(",", "."))
+    except Exception:
+        return f"EUR {raw}"
+    return f"EUR {amount.quantize(Decimal('0.01'))}"

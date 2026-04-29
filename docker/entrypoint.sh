@@ -3,19 +3,14 @@ set -euo pipefail
 
 umask 027
 
-OPENCLAW_HOME="${OPENCLAW_HOME:-/home/openclaw}"
-OPENCLAW_CONFIG_DIR="${OPENCLAW_CONFIG_DIR:-${OPENCLAW_HOME}/.openclaw}"
-OPENCLAW_WORKSPACE="${OPENCLAW_WORKSPACE:-/home/openclaw/workspace}"
-BUNDLE_ROOT="${BUNDLE_ROOT:-/opt/firefly-openclaw/workspace}"
-CONFIG_BUNDLE="${CONFIG_BUNDLE:-/opt/firefly-openclaw/config/openclaw.base.json5}"
-BIN_ROOT="${BIN_ROOT:-/opt/firefly-openclaw/bin}"
-RUNTIME_PORT="${OPENCLAW_PORT:-18789}"
-RUNTIME_BIND="${OPENCLAW_BIND:-loopback}"
-RUNTIME_MODEL="${OPENCLAW_DEFAULT_MODEL:-openai/gpt-5.4-mini}"
+PICOCLAW_HOME="${PICOCLAW_HOME:-/home/picoclaw}"
+PICOCLAW_CONFIG_DIR="${PICOCLAW_CONFIG_DIR:-${PICOCLAW_HOME}/.picoclaw}"
+PICOCLAW_WORKSPACE="${PICOCLAW_WORKSPACE:-${PICOCLAW_CONFIG_DIR}/workspace}"
+BUNDLE_ROOT="${BUNDLE_ROOT:-/opt/firefly-picoclaw/workspace}"
+BIN_ROOT="${BIN_ROOT:-/opt/firefly-picoclaw/bin}"
+RUNTIME_PORT="${PICOCLAW_PORT:-18790}"
+RUNTIME_HOST="${PICOCLAW_GATEWAY_HOST:-127.0.0.1}"
 VERIFY_ON_BOOT="${FIREFLY_RUNTIME_VERIFY_ON_BOOT:-true}"
-STARTUP_NOTICE_COOLDOWN_SECONDS="${STARTUP_NOTICE_COOLDOWN_SECONDS:-86400}"
-SEND_UNHEALTHY_STARTUP_MESSAGE="${SEND_UNHEALTHY_STARTUP_MESSAGE:-false}"
-FIREFLY_BOOTSTRAP_WARNING=""
 
 read_secret() {
   local variable_name="$1"
@@ -44,61 +39,6 @@ read_secret() {
   return 1
 }
 
-send_telegram_message() {
-  local message="$1"
-  local delivery_target="${TELEGRAM_TARGET_ID:-${TELEGRAM_OWNER_ID:-}}"
-  if [[ -z "${TELEGRAM_TOKEN:-}" || -z "${delivery_target}" ]]; then
-    return 0
-  fi
-
-  curl -fsS -X POST \
-    "https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage" \
-    --data-urlencode "chat_id=${delivery_target}" \
-    --data-urlencode "text=${message}" \
-    >/dev/null || true
-}
-
-should_send_startup_notice() {
-  local status="$1"
-  local state_file="${OPENCLAW_CONFIG_DIR}/startup-notice.state"
-  local now
-  now="$(date +%s)"
-
-  if [[ "${status}" == "unhealthy" ]]; then
-    local unhealthy_enabled
-    unhealthy_enabled="$(printf '%s' "${SEND_UNHEALTHY_STARTUP_MESSAGE}" | tr '[:upper:]' '[:lower:]')"
-    if [[ "${unhealthy_enabled}" != "1" && "${unhealthy_enabled}" != "true" && "${unhealthy_enabled}" != "yes" && "${unhealthy_enabled}" != "on" ]]; then
-      return 1
-    fi
-  fi
-
-  if [[ -f "${state_file}" ]]; then
-    local last_status=""
-    local last_ts="0"
-    IFS=' ' read -r last_status last_ts < "${state_file}" || true
-    if [[ "${last_status}" == "${status}" ]] && [[ $((now - last_ts)) -lt ${STARTUP_NOTICE_COOLDOWN_SECONDS} ]]; then
-      return 1
-    fi
-  fi
-
-  printf '%s %s\n' "${status}" "${now}" > "${state_file}"
-  chmod 600 "${state_file}" || true
-  return 0
-}
-
-health_headers=()
-if [[ -n "${OPENCLAW_GATEWAY_TOKEN:-}" ]]; then
-  health_headers=(-H "Authorization: Bearer ${OPENCLAW_GATEWAY_TOKEN}")
-fi
-
-fail_with_telegram() {
-  local code="$1"
-  local message="$2"
-  send_telegram_message "firefly-openclaw-companion startup failed: ${message}"
-  echo "${message}" >&2
-  exit "${code}"
-}
-
 ensure_dir() {
   local path="$1"
   local mode="$2"
@@ -106,114 +46,51 @@ ensure_dir() {
   chmod "${mode}" "${path}"
 }
 
-write_if_absent() {
-  local target="$1"
-  local source="$2"
-  if [[ ! -e "${target}" ]]; then
-    cp "${source}" "${target}"
+secret_from_standard_locations() {
+  local name="$1"
+  local secret_name="$2"
+  read_secret "${name}" "/run/secrets/${secret_name}" \
+    || read_secret "${name}" "/run/host-secrets/${secret_name}.txt" \
+    || true
+}
+
+archive_legacy_openclaw_state() {
+  local legacy_dir="${PICOCLAW_HOME}/.openclaw"
+  if [[ -d "${legacy_dir}" ]]; then
+    local archive_dir="${PICOCLAW_HOME}/.openclaw.legacy.$(date -u +%Y%m%dT%H%M%SZ)"
+    mv "${legacy_dir}" "${archive_dir}"
+    echo "Archived incompatible OpenClaw state at ${archive_dir}; PicoClaw uses ${PICOCLAW_CONFIG_DIR}." >&2
   fi
 }
 
-ensure_dir "${OPENCLAW_HOME}" 700
-ensure_dir "${OPENCLAW_CONFIG_DIR}" 700
-ensure_dir "${OPENCLAW_WORKSPACE}" 700
-ensure_dir "${OPENCLAW_WORKSPACE}/config" 750
-ensure_dir "${OPENCLAW_WORKSPACE}/logs" 750
-ensure_dir "${OPENCLAW_WORKSPACE}/skills" 750
-ensure_dir "${OPENCLAW_WORKSPACE}/tools" 750
+ensure_dir "${PICOCLAW_HOME}" 700
+ensure_dir "${PICOCLAW_CONFIG_DIR}" 700
+ensure_dir "${PICOCLAW_WORKSPACE}" 700
+ensure_dir "${PICOCLAW_WORKSPACE}/config" 750
+ensure_dir "${PICOCLAW_CONFIG_DIR}/logs" 750
+ensure_dir "${PICOCLAW_CONFIG_DIR}/.security" 700
 
-"${BIN_ROOT}/install_bundle_to_workspace.sh" "${BUNDLE_ROOT}" "${OPENCLAW_WORKSPACE}"
+archive_legacy_openclaw_state
+"${BIN_ROOT}/install_bundle_to_workspace.sh" "${BUNDLE_ROOT}" "${PICOCLAW_WORKSPACE}"
 
-write_if_absent "${OPENCLAW_CONFIG_DIR}/openclaw.base.json5" "${CONFIG_BUNDLE}"
-
-# Migrate older persisted base configs that hardcoded the legacy OpenAI model.
-# The runtime config now owns model selection so provider choice from setup is
-# not shadowed by a stale volume copy.
-if [[ -f "${OPENCLAW_CONFIG_DIR}/openclaw.base.json5" ]] && grep -q 'primary: "openai/gpt-5.4-mini"' "${OPENCLAW_CONFIG_DIR}/openclaw.base.json5"; then
-  python3 - "${OPENCLAW_CONFIG_DIR}/openclaw.base.json5" <<'PY'
-from pathlib import Path
-import re
-import sys
-
-path = Path(sys.argv[1])
-text = path.read_text(encoding="utf-8")
-text = re.sub(
-    r'\n\s*model:\s*\{\s*\n\s*primary:\s*"openai/gpt-5\.4-mini",\s*\n\s*\},',
-    "",
-    text,
-    count=1,
-)
-path.write_text(text, encoding="utf-8")
-PY
-  chmod 600 "${OPENCLAW_CONFIG_DIR}/openclaw.base.json5"
-fi
-
-sync_agent_state() {
-  python3 - "${OPENCLAW_CONFIG_DIR}" "${RUNTIME_MODEL}" <<'PY'
-from __future__ import annotations
-
-from pathlib import Path
-import shutil
-import sys
-
-config_dir = Path(sys.argv[1])
-runtime_model = sys.argv[2]
-legacy_model = "openai/gpt-5.4-mini"
-agent_dir = config_dir / "agents" / "main" / "agent"
-
-if agent_dir.exists():
-    for path in agent_dir.rglob("*"):
-        if not path.is_file():
-            continue
-        if path.suffix.lower() not in {"", ".json", ".json5", ".yaml", ".yml", ".txt", ".md"}:
-            continue
-        try:
-            text = path.read_text(encoding="utf-8")
-        except (UnicodeDecodeError, OSError):
-            continue
-        if legacy_model in text and runtime_model != legacy_model:
-            path.write_text(text.replace(legacy_model, runtime_model), encoding="utf-8")
-
-root_auth_candidates = sorted(
-    p for p in config_dir.rglob("auth-profiles.json")
-    if agent_dir not in p.parents
-)
-agent_auth = agent_dir / "auth-profiles.json"
-if root_auth_candidates and runtime_model.startswith("openai-codex/"):
-    source = root_auth_candidates[0]
-    copy_required = not agent_auth.exists()
-    if not copy_required:
-        try:
-            copy_required = "openai-codex" not in agent_auth.read_text(encoding="utf-8")
-        except (UnicodeDecodeError, OSError):
-            copy_required = True
-    if copy_required:
-        agent_auth.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(source, agent_auth)
-PY
-}
-
-GATEWAY_TOKEN="$(read_secret OPENCLAW_GATEWAY_TOKEN /run/secrets/openclaw_gateway_token || true)"
-FIREFLY_TOKEN="$(read_secret FIREFLY_ACCESS_TOKEN /run/secrets/firefly_access_token || true)"
-if [[ -z "${GATEWAY_TOKEN}" ]]; then
-  GATEWAY_TOKEN="$(read_secret OPENCLAW_GATEWAY_TOKEN /run/host-secrets/openclaw_gateway_token.txt || true)"
-fi
-if [[ -z "${FIREFLY_TOKEN}" ]]; then
-  FIREFLY_TOKEN="$(read_secret FIREFLY_ACCESS_TOKEN /run/host-secrets/firefly_access_token.txt || true)"
-fi
-TELEGRAM_TOKEN="$(read_secret TELEGRAM_BOT_TOKEN /run/host-secrets/telegram_bot_token.txt || true)"
-
-if [[ -z "${GATEWAY_TOKEN}" ]]; then
-  echo "OPENCLAW_GATEWAY_TOKEN is required via env or Docker secret." >&2
-  exit 11
-fi
+OPENAI_TOKEN="$(secret_from_standard_locations OPENAI_API_KEY openai_api_key)"
+ANTHROPIC_TOKEN="$(secret_from_standard_locations ANTHROPIC_API_KEY anthropic_api_key)"
+OPENROUTER_TOKEN="$(secret_from_standard_locations OPENROUTER_API_KEY openrouter_api_key)"
+GROQ_TOKEN="$(secret_from_standard_locations GROQ_API_KEY groq_api_key)"
+GOOGLE_TOKEN="$(secret_from_standard_locations GOOGLE_API_KEY google_api_key)"
+TELEGRAM_TOKEN="$(secret_from_standard_locations TELEGRAM_BOT_TOKEN telegram_bot_token)"
+FIREFLY_TOKEN="$(secret_from_standard_locations FIREFLY_ACCESS_TOKEN firefly_access_token)"
+PDFAPIHUB_TOKEN="$(secret_from_standard_locations PDFAPIHUB_API_KEY pdfapihub_api_key)"
 
 if [[ -z "${FIREFLY_TOKEN}" ]]; then
-  fail_with_telegram 12 "FIREFLY_ACCESS_TOKEN is required via env or Docker secret."
+  echo "Error: FIREFLY_ACCESS_TOKEN is required via env, *_FILE, Docker secret, or /run/host-secrets/firefly_access_token.txt." >&2
+  exit 12
 fi
 
-export OPENCLAW_GATEWAY_TOKEN="${GATEWAY_TOKEN}"
-export FIREFLY_ACCESS_TOKEN="${FIREFLY_TOKEN}"
+export PICOCLAW_CONFIG_DIR PICOCLAW_WORKSPACE RUNTIME_PORT RUNTIME_HOST
+export PICOCLAW_DEFAULT_MODEL_NAME="${PICOCLAW_DEFAULT_MODEL_NAME:-gemini}"
+export PICOCLAW_DEFAULT_MODEL="${PICOCLAW_DEFAULT_MODEL:-gemini/gemini-2.5-flash}"
+export PICOCLAW_LOG_LEVEL="${PICOCLAW_LOG_LEVEL:-info}"
 export FIREFLY_BASE_URL="${FIREFLY_BASE_URL:-http://firefly:8080}"
 export FIREFLY_API_BASE_PATH="${FIREFLY_API_BASE_PATH:-/api/v1}"
 export FIREFLY_TIMEOUT_SECONDS="${FIREFLY_TIMEOUT_SECONDS:-15}"
@@ -228,266 +105,248 @@ export FIREFLY_ALLOW_DELETE="${FIREFLY_ALLOW_DELETE:-false}"
 export FIREFLY_ACCESS_TOKEN_EXPIRES_ON="${FIREFLY_ACCESS_TOKEN_EXPIRES_ON:-}"
 export FIREFLY_TOKEN_REMINDER_DAYS="${FIREFLY_TOKEN_REMINDER_DAYS:-60,30,14,7,3,1}"
 export FIREFLY_TOKEN_REMINDER_CHECK_INTERVAL_SECONDS="${FIREFLY_TOKEN_REMINDER_CHECK_INTERVAL_SECONDS:-21600}"
-export FIREFLY_MAPPINGS_PATH="${FIREFLY_MAPPINGS_PATH:-${OPENCLAW_WORKSPACE}/config/mappings.yml}"
-export FIREFLY_POLICY_PATH="${FIREFLY_POLICY_PATH:-${OPENCLAW_WORKSPACE}/config/policy.yml}"
+export FIREFLY_MAPPINGS_PATH="${FIREFLY_MAPPINGS_PATH:-${PICOCLAW_WORKSPACE}/config/mappings.yml}"
+export FIREFLY_POLICY_PATH="${FIREFLY_POLICY_PATH:-${PICOCLAW_WORKSPACE}/config/policy.yml}"
 export TELEGRAM_ENABLED="${TELEGRAM_ENABLED:-true}"
+export PICOCLAW_TELEGRAM_CHANNEL_ENABLED="${PICOCLAW_TELEGRAM_CHANNEL_ENABLED:-false}"
 export TELEGRAM_OWNER_ID="${TELEGRAM_OWNER_ID:-${TELEGRAM_TARGET_ID:-}}"
 export TELEGRAM_TARGET_ID="${TELEGRAM_TARGET_ID:-${TELEGRAM_OWNER_ID:-}}"
-export TELEGRAM_DM_POLICY="${TELEGRAM_DM_POLICY:-allowlist}"
 export FIREFLY_CHAT_LANGUAGE="${FIREFLY_CHAT_LANGUAGE:-auto}"
-export OPENCLAW_BIND="${RUNTIME_BIND}"
-export OPENCLAW_TELEGRAM_CHANNEL_ENABLED="${OPENCLAW_TELEGRAM_CHANNEL_ENABLED:-false}"
+export FIREFLY_ACCESS_TOKEN="${FIREFLY_TOKEN}"
+export FIREFLY_ACCESS_TOKEN_FILE="${PICOCLAW_CONFIG_DIR}/.security/firefly_access_token"
+export TELEGRAM_BOT_TOKEN="${TELEGRAM_TOKEN}"
+export OPENAI_API_KEY="${OPENAI_TOKEN}"
+export ANTHROPIC_API_KEY="${ANTHROPIC_TOKEN}"
+export OPENROUTER_API_KEY="${OPENROUTER_TOKEN}"
+export GROQ_API_KEY="${GROQ_TOKEN}"
+export GOOGLE_API_KEY="${GOOGLE_TOKEN}"
+export PDFAPIHUB_API_KEY="${PDFAPIHUB_TOKEN}"
 
-localized_text() {
-  local key="$1"
-  if [[ "${FIREFLY_CHAT_LANGUAGE}" == "it" ]]; then
-    case "${key}" in
-      startup_ok)
-        printf '%s' "Firefly bridge sano. Bot pronto. /help mostra cosa puoi chiedermi."
-        ;;
-      startup_warn)
-        printf '%s' "Firefly bridge avviato con avviso. /help mostra cosa puoi chiedermi."
-        ;;
-      gateway_unhealthy)
-        printf '%s' "Sono partito, ma il gateway OpenClaw non è ancora sano su localhost:${RUNTIME_PORT}. Controlla i log di docker compose."
-        ;;
-    esac
-    return 0
-  fi
-
-  case "${key}" in
-    startup_ok)
-      printf '%s' "Firefly bridge is healthy. Bot ready. /help shows what you can ask."
-      ;;
-    startup_warn)
-      printf '%s' "Firefly bridge started with a warning. /help shows what you can ask."
-      ;;
-    gateway_unhealthy)
-      printf '%s' "I started, but the OpenClaw gateway is still not healthy on localhost:${RUNTIME_PORT}. Check docker compose logs."
-      ;;
-  esac
-}
-
-TELEGRAM_CONFIG_BLOCK=""
-if [[ "${TELEGRAM_ENABLED}" == "true" ]]; then
-  if [[ -z "${TELEGRAM_TOKEN}" ]]; then
-    echo "TELEGRAM_ENABLED=true but no Telegram bot token was provided." >&2
-    exit 14
-  fi
-  if [[ "${TELEGRAM_DM_POLICY}" == "allowlist" || "${TELEGRAM_DM_POLICY}" == "open" ]]; then
-    if [[ -z "${TELEGRAM_OWNER_ID}" ]]; then
-      fail_with_telegram 15 "TELEGRAM_OWNER_ID is required when Telegram is enabled with dmPolicy=${TELEGRAM_DM_POLICY}."
-    fi
-  fi
-  TELEGRAM_ALLOW_FROM_VALUE="${TELEGRAM_OWNER_ID}"
-  if [[ "${TELEGRAM_ALLOW_FROM_VALUE}" =~ ^-?[0-9]+$ ]]; then
-    TELEGRAM_ALLOW_FROM_VALUE=${TELEGRAM_ALLOW_FROM_VALUE}
-  else
-    TELEGRAM_ALLOW_FROM_VALUE="\"${TELEGRAM_ALLOW_FROM_VALUE}\""
-  fi
-  TELEGRAM_DEFAULT_TO_VALUE="\"${TELEGRAM_TARGET_ID}\""
-  if [[ "${OPENCLAW_TELEGRAM_CHANNEL_ENABLED}" == "true" ]]; then
-    TELEGRAM_CONFIG_BLOCK="$(cat <<EOF
-  channels: {
-    telegram: {
-      enabled: true,
-      botToken: "${TELEGRAM_TOKEN}",
-      dmPolicy: "${TELEGRAM_DM_POLICY}",
-      allowFrom: [${TELEGRAM_ALLOW_FROM_VALUE}],
-      defaultTo: ${TELEGRAM_DEFAULT_TO_VALUE},
-      groupPolicy: "disabled",
-    },
-  },
-EOF
-)"
-  fi
+if [[ "${TELEGRAM_ENABLED}" == "true" && -z "${TELEGRAM_TOKEN}" ]]; then
+  echo "Error: TELEGRAM_ENABLED=true but no Telegram bot token was provided." >&2
+  exit 14
 fi
 
-PLUGIN_CONFIG_BLOCK="$(cat <<EOF
-  plugins: {
-    entries: {
-      bonjour: {
-        enabled: false,
-      },
-    },
-  },
-EOF
-)"
+if [[ "${TELEGRAM_ENABLED}" == "true" && -z "${TELEGRAM_OWNER_ID}" ]]; then
+  echo "Error: TELEGRAM_OWNER_ID is required when Telegram is enabled." >&2
+  exit 15
+fi
 
-cat > "${OPENCLAW_CONFIG_DIR}/openclaw.runtime.json5" <<EOF
-{
-  gateway: {
-    mode: "local",
-    bind: "${RUNTIME_BIND}",
-    port: ${RUNTIME_PORT},
-    http: {
-      endpoints: {
-        responses: {
-          enabled: true,
-        },
-      },
-    },
-    controlUi: {
-      enabled: false,
-    },
-    auth: {
-      mode: "token",
-      token: "${GATEWAY_TOKEN}",
-      allowTailscale: false,
-    },
-  },
-  agents: {
-    defaults: {
-      workspace: "${OPENCLAW_WORKSPACE}",
-      model: {
-        primary: "${RUNTIME_MODEL}",
-      },
-    },
-  },
-${TELEGRAM_CONFIG_BLOCK}
-${PLUGIN_CONFIG_BLOCK}
+if [[ ! -f "${PICOCLAW_CONFIG_DIR}/config.json" ]]; then
+  picoclaw onboard >/dev/null 2>&1 || true
+fi
+
+python3 <<'PY'
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+
+import yaml
+
+config_dir = Path(os.environ["PICOCLAW_CONFIG_DIR"])
+workspace = Path(os.environ["PICOCLAW_WORKSPACE"])
+security_dir = config_dir / ".security"
+security_dir.mkdir(parents=True, exist_ok=True)
+
+telegram_owner = os.getenv("TELEGRAM_OWNER_ID", "").strip()
+telegram_enabled = os.getenv("PICOCLAW_TELEGRAM_CHANNEL_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
+
+model_name = os.getenv("PICOCLAW_DEFAULT_MODEL_NAME", "gemini")
+model_string = os.getenv("PICOCLAW_DEFAULT_MODEL", "gemini/gemini-2.5-flash")
+
+# Determine auth method and API key reference based on provider.
+auth_method = "api_key"
+api_key_ref = None
+
+if model_name == "codex":
+    auth_method = "oauth"
+elif model_name == "groq":
+    auth_method = "api_key"
+    api_key_ref = "ref:groq_api_key"
+elif model_name == "openai":
+    auth_method = "api_key"
+    api_key_ref = "ref:openai_api_key"
+elif model_name == "anthropic":
+    auth_method = "api_key"
+    api_key_ref = "ref:anthropic_api_key"
+elif model_name == "openrouter":
+    auth_method = "api_key"
+    api_key_ref = "ref:openrouter_api_key"
+elif model_name in {"google", "gemini"}:
+    auth_method = "api_key"
+    api_key_ref = "ref:google_api_key"
+
+model_config = {
+    "model_name": model_name,
+    "model": model_string,
+    "auth_method": auth_method,
 }
-EOF
-chmod 600 "${OPENCLAW_CONFIG_DIR}/openclaw.runtime.json5"
+if api_key_ref:
+    model_config["api_key"] = api_key_ref
 
-sync_agent_state
-
-cat > "${OPENCLAW_CONFIG_DIR}/openclaw.json" <<EOF
-{
-  gateway: {
-    mode: "local",
-    bind: "${RUNTIME_BIND}",
-    port: ${RUNTIME_PORT},
-    http: {
-      endpoints: {
-        responses: {
-          enabled: true,
+config = {
+    "agents": {
+        "defaults": {
+            "workspace": str(workspace),
+            "restrict_to_workspace": True,
+            "model_name": model_name,
+            "max_tokens": 8192,
+            "context_window": 131072,
+            "temperature": 0.7,
+            "max_tool_iterations": 20,
+        }
+    },
+    "model_list": [model_config],
+    "channels": {
+        "telegram": {
+            "enabled": telegram_enabled,
+            "token": "ref:telegram_bot_token",
+            "allow_from": [telegram_owner] if telegram_owner else [],
+            "use_markdown_v2": False,
+            "streaming": {"enabled": True},
+        }
+    },
+    "tools": {
+        "exec": {"enabled": False},
+        "cron": {"enabled": False},
+        "web": {"enabled": False},
+        "i2c": {"enabled": False},
+        "serial": {"enabled": False},
+        "send_tts": {"enabled": False},
+        "skills": {"enabled": False},
+        "find_skills": {"enabled": False},
+        "install_skill": {"enabled": False},
+        "spawn": {"enabled": True},
+        "subagent": {"enabled": True},
+        "message": {"enabled": True},
+        "list_dir": {"enabled": True},
+        "read_file": {"enabled": True, "mode": "bytes"},
+        "write_file": {"enabled": True},
+        "edit_file": {"enabled": True},
+        "append_file": {"enabled": True},
+        "web_fetch": {"enabled": False},
+        "media_cleanup": {"enabled": True, "max_age_minutes": 30, "interval_minutes": 5},
+        "mcp": {
+            "enabled": True,
+            "servers": {
+                "firefly-bridge": {
+                    "enabled": True,
+                    "command": "/opt/firefly-picoclaw/bin/firefly-bridge",
+                    "env": {
+                        "FIREFLY_BASE_URL": os.getenv("FIREFLY_BASE_URL", ""),
+                        "FIREFLY_API_BASE_PATH": os.getenv("FIREFLY_API_BASE_PATH", ""),
+                        "FIREFLY_TIMEOUT_SECONDS": os.getenv("FIREFLY_TIMEOUT_SECONDS", ""),
+                        "FIREFLY_REQUEST_RETRIES": os.getenv("FIREFLY_REQUEST_RETRIES", ""),
+                        "FIREFLY_RETRY_BACKOFF_SECONDS": os.getenv("FIREFLY_RETRY_BACKOFF_SECONDS", ""),
+                        "FIREFLY_VERIFY_TLS": os.getenv("FIREFLY_VERIFY_TLS", ""),
+                        "FIREFLY_FORCE_CONNECTION_CLOSE": os.getenv("FIREFLY_FORCE_CONNECTION_CLOSE", ""),
+                        "FIREFLY_DEFAULT_DRY_RUN": os.getenv("FIREFLY_DEFAULT_DRY_RUN", ""),
+                        "FIREFLY_HIGH_VALUE_THRESHOLD": os.getenv("FIREFLY_HIGH_VALUE_THRESHOLD", ""),
+                        "FIREFLY_DEDUPE_WINDOW_DAYS": os.getenv("FIREFLY_DEDUPE_WINDOW_DAYS", ""),
+                        "FIREFLY_ALLOW_DELETE": os.getenv("FIREFLY_ALLOW_DELETE", ""),
+                        "FIREFLY_MAPPINGS_PATH": os.getenv("FIREFLY_MAPPINGS_PATH", ""),
+                        "FIREFLY_POLICY_PATH": os.getenv("FIREFLY_POLICY_PATH", ""),
+                        "FIREFLY_ACCESS_TOKEN_FILE": os.getenv("FIREFLY_ACCESS_TOKEN_FILE", ""),
+                    },
+                }
+            },
         },
-      },
     },
-    controlUi: {
-      enabled: false,
+    "hooks": {"enabled": True},
+    "heartbeat": {"enabled": True, "interval": 30},
+    "gateway": {
+        "host": os.getenv("RUNTIME_HOST", "127.0.0.1"),
+        "port": int(os.getenv("RUNTIME_PORT", "18790")),
+        "log_level": os.getenv("PICOCLAW_LOG_LEVEL", "info"),
     },
-    auth: {
-      mode: "token",
-      token: "${GATEWAY_TOKEN}",
-      allowTailscale: false,
-    },
-  },
-  tools: {
-    deny: ["browser", "canvas", "nodes", "cron"],
-    allow: ["gateway"],
-  },
-  browser: {
-    enabled: false,
-  },
-  agents: {
-    defaults: {
-      workspace: "${OPENCLAW_WORKSPACE}",
-      model: {
-        primary: "${RUNTIME_MODEL}",
-      },
-    },
-  },
-${TELEGRAM_CONFIG_BLOCK}
-${PLUGIN_CONFIG_BLOCK}
-  skills: {
-    load: {
-      watch: false,
-    },
-  },
-  logging: {
-    level: "info",
-    consoleLevel: "info",
-    consoleStyle: "compact",
-    redactSensitive: "tools",
-    file: "${OPENCLAW_WORKSPACE}/logs/openclaw.log",
-  },
 }
-EOF
-chmod 600 "${OPENCLAW_CONFIG_DIR}/openclaw.json"
 
-cat > "${OPENCLAW_CONFIG_DIR}/firefly-bridge.env" <<EOF
-FIREFLY_BASE_URL=${FIREFLY_BASE_URL}
-FIREFLY_API_BASE_PATH=${FIREFLY_API_BASE_PATH}
-FIREFLY_TIMEOUT_SECONDS=${FIREFLY_TIMEOUT_SECONDS}
-FIREFLY_REQUEST_RETRIES=${FIREFLY_REQUEST_RETRIES}
-FIREFLY_RETRY_BACKOFF_SECONDS=${FIREFLY_RETRY_BACKOFF_SECONDS}
-FIREFLY_VERIFY_TLS=${FIREFLY_VERIFY_TLS}
-FIREFLY_FORCE_CONNECTION_CLOSE=${FIREFLY_FORCE_CONNECTION_CLOSE}
-FIREFLY_DEFAULT_DRY_RUN=${FIREFLY_DEFAULT_DRY_RUN}
-FIREFLY_HIGH_VALUE_THRESHOLD=${FIREFLY_HIGH_VALUE_THRESHOLD}
-FIREFLY_DEDUPE_WINDOW_DAYS=${FIREFLY_DEDUPE_WINDOW_DAYS}
-FIREFLY_ALLOW_DELETE=${FIREFLY_ALLOW_DELETE}
-FIREFLY_ACCESS_TOKEN_EXPIRES_ON=${FIREFLY_ACCESS_TOKEN_EXPIRES_ON}
-FIREFLY_TOKEN_REMINDER_DAYS=${FIREFLY_TOKEN_REMINDER_DAYS}
-FIREFLY_TOKEN_REMINDER_CHECK_INTERVAL_SECONDS=${FIREFLY_TOKEN_REMINDER_CHECK_INTERVAL_SECONDS}
-FIREFLY_MAPPINGS_PATH=${FIREFLY_MAPPINGS_PATH}
-FIREFLY_POLICY_PATH=${FIREFLY_POLICY_PATH}
-TELEGRAM_OWNER_ID=${TELEGRAM_OWNER_ID}
-TELEGRAM_TARGET_ID=${TELEGRAM_TARGET_ID}
-FIREFLY_CHAT_LANGUAGE=${FIREFLY_CHAT_LANGUAGE}
-FIREFLY_ACCESS_TOKEN=${FIREFLY_TOKEN}
-EOF
-chmod 600 "${OPENCLAW_CONFIG_DIR}/firefly-bridge.env"
+config_path = config_dir / "config.json"
+config_path.write_text(json.dumps(config, indent=2, sort_keys=False) + "\n", encoding="utf-8")
+config_path.chmod(0o600)
+
+security = {
+    "telegram_bot_token": os.getenv("TELEGRAM_BOT_TOKEN", ""),
+    "openai_api_key": os.getenv("OPENAI_API_KEY", ""),
+    "anthropic_api_key": os.getenv("ANTHROPIC_API_KEY", ""),
+    "openrouter_api_key": os.getenv("OPENROUTER_API_KEY", ""),
+    "groq_api_key": os.getenv("GROQ_API_KEY", ""),
+    "google_api_key": os.getenv("GOOGLE_API_KEY", ""),
+    "pdfapihub_api_key": os.getenv("PDFAPIHUB_API_KEY", ""),
+}
+(config_dir / ".security.yml").write_text(yaml.safe_dump(security, sort_keys=False), encoding="utf-8")
+(config_dir / ".security.yml").chmod(0o600)
+
+token_path = security_dir / "firefly_access_token"
+token_path.write_text(os.getenv("FIREFLY_ACCESS_TOKEN", "") + "\n", encoding="utf-8")
+token_path.chmod(0o600)
+PY
+
+# PicoClaw 0.2.x reads config from $HOME/config.json and $HOME/.security.yml,
+# then migrates them in place to its current schema. Seed those root paths from
+# the mounted .picoclaw files on every boot so env changes are applied.
+cp "${PICOCLAW_CONFIG_DIR}/config.json" "${PICOCLAW_HOME}/config.json"
+cp "${PICOCLAW_CONFIG_DIR}/.security.yml" "${PICOCLAW_HOME}/.security.yml"
+chmod 0600 "${PICOCLAW_HOME}/config.json" "${PICOCLAW_HOME}/.security.yml"
+
+# Force schema migration before gateway startup, then replace migrated secret
+# placeholders with actual values. PicoClaw v3 stores secrets in a nested shape
+# matching config.json, not in the flat legacy file generated above.
+picoclaw status >/dev/null 2>&1 || true
+
+python3 <<'PY'
+from __future__ import annotations
+
+import os
+from pathlib import Path
+
+import yaml
+
+home = Path(os.environ["PICOCLAW_HOME"])
+security_path = home / ".security.yml"
+security = yaml.safe_load(security_path.read_text(encoding="utf-8")) if security_path.exists() else {}
+if not isinstance(security, dict):
+    security = {}
+
+channel_list = security.setdefault("channel_list", {})
+telegram = channel_list.setdefault("telegram", {})
+telegram_settings = telegram.setdefault("settings", {})
+telegram_settings["token"] = os.getenv("TELEGRAM_BOT_TOKEN", "")
+
+model_name = os.getenv("PICOCLAW_DEFAULT_MODEL_NAME", "gemini")
+model_secrets = {
+    "groq": os.getenv("GROQ_API_KEY", ""),
+    "openai": os.getenv("OPENAI_API_KEY", ""),
+    "anthropic": os.getenv("ANTHROPIC_API_KEY", ""),
+    "openrouter": os.getenv("OPENROUTER_API_KEY", ""),
+    "google": os.getenv("GOOGLE_API_KEY", ""),
+    "gemini": os.getenv("GOOGLE_API_KEY", ""),
+}
+if model_name in model_secrets:
+    model_list = security.setdefault("model_list", {})
+    model_list[f"{model_name}:0"] = {"api_keys": [model_secrets[model_name]]}
+
+security_path.write_text(yaml.safe_dump(security, sort_keys=False), encoding="utf-8")
+security_path.chmod(0o600)
+PY
 
 if [[ "${VERIFY_ON_BOOT}" == "true" ]]; then
-  firefly_health_output="$(python3 -m firefly_companion.cli health 2>&1 || true)"
-  if [[ "${firefly_health_output}" != *'"status": "ok"'* ]]; then
-    FIREFLY_BOOTSTRAP_WARNING="Firefly bridge health check failed during bootstrap. ${firefly_health_output}"
-    echo "${FIREFLY_BOOTSTRAP_WARNING}" >&2
+  if ! python3 -m firefly_companion.cli health >/dev/null 2>&1; then
+    echo "Warning: Firefly bridge health check failed during bootstrap." >&2
   fi
 fi
 
 if [[ "$#" -eq 0 ]]; then
-  set -- openclaw gateway
+  set -- picoclaw gateway
 fi
 
-if [[ "$1" == "openclaw" && "${2:-}" == "gateway" ]]; then
-  python3 /opt/firefly-openclaw/bin/token_expiry_reminder.py &
-  reminder_pid=$!
-  FIREFLY_TELEGRAM_BOT_TOKEN="${TELEGRAM_TOKEN:-}" \
-  FIREFLY_TELEGRAM_OWNER_ID="${TELEGRAM_OWNER_ID:-}" \
-  python3 /opt/firefly-openclaw/bin/telegram_firefly_bot.py &
-  telegram_bot_pid=$!
-  if [[ "${OPENCLAW_TELEGRAM_CHANNEL_ENABLED}" != "true" ]]; then
-    unset TELEGRAM_BOT_TOKEN
+if [[ "$1" == "picoclaw" && "${2:-}" == "gateway" ]]; then
+  python3 /opt/firefly-picoclaw/bin/token_expiry_reminder.py &
+  if [[ "${TELEGRAM_ENABLED}" == "true" ]]; then
+    python3 /opt/firefly-picoclaw/bin/telegram_firefly_bot.py &
   fi
-  "$@" &
-  gateway_pid=$!
-
-  health_url="http://127.0.0.1:${RUNTIME_PORT}/health"
-  gateway_ready=false
-  for _ in $(seq 1 45); do
-    if curl -fsS "${health_headers[@]}" "${health_url}" >/dev/null 2>&1; then
-      gateway_ready=true
-      break
-    fi
-    if ! kill -0 "${gateway_pid}" >/dev/null 2>&1; then
-      break
-    fi
-    sleep 2
-  done
-
-  if [[ "${gateway_ready}" == "true" ]]; then
-    startup_message="$(localized_text startup_warn)"
-    if [[ -n "${FIREFLY_BOOTSTRAP_WARNING}" ]]; then
-      startup_message="${startup_message} Warning: ${FIREFLY_BOOTSTRAP_WARNING}"
-    else
-      startup_message="$(localized_text startup_ok)"
-    fi
-    if should_send_startup_notice "ok"; then
-      send_telegram_message "${startup_message}"
-    fi
-  else
-    if should_send_startup_notice "unhealthy"; then
-      send_telegram_message "$(localized_text gateway_unhealthy)"
-    fi
-  fi
-
-  wait "${gateway_pid}"
-  kill "${telegram_bot_pid}" >/dev/null 2>&1 || true
-  kill "${reminder_pid}" >/dev/null 2>&1 || true
-else
-  exec "$@"
 fi
+
+exec "$@"

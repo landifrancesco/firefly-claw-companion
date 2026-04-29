@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
-import base64
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from decimal import Decimal
@@ -25,7 +24,12 @@ from requests import Response
 from requests.exceptions import RequestException
 
 from firefly_companion import conversation as conversation_module
-from firefly_companion.ai_router import router_health
+from firefly_companion.ai_router import (
+    RouterGatewayError as AIRouterGatewayError,
+    call_ai_text,
+    call_ai_vision,
+    router_health,
+)
 from firefly_companion.bridge import BridgeService, flatten_transactions
 from firefly_companion.client import FireflyAPIError, FireflyClient
 from firefly_companion.config import BridgeSettings, ConfigurationError
@@ -37,7 +41,7 @@ from firefly_companion.object_cache import FireflyObjectCache
 from firefly_companion.receipt_parser import count_visible_transactions
 
 
-STATE_PATH = Path(os.getenv("OPENCLAW_HOME", str(Path.home()))) / ".openclaw" / "telegram-bot-state.json"
+STATE_PATH = Path(os.getenv("PICOCLAW_CONFIG_DIR", str(Path.home() / ".picoclaw"))) / "telegram-bot-state.json"
 POLL_TIMEOUT_SECONDS = 30
 ALLOWED_PRIVATE_CHAT_TYPES = {"private"}
 TELEGRAM_TEXT_LIMIT = 3900
@@ -49,6 +53,8 @@ PROFILE_SETUP_STEPS = (
     "expense_destination_account",
     "income_source_account",
     "income_destination_account",
+    "card_payment_account",
+    "cash_payment_account",
     "ask_budget_when_missing",
     "auto_budget_from_history",
 )
@@ -56,10 +62,6 @@ _AUTOFILL_TX_CACHE: dict[str, Any] = {"loaded_at": 0.0, "records": []}
 
 
 class TelegramBotError(RuntimeError):
-    pass
-
-
-class RouterGatewayError(RuntimeError):
     pass
 
 
@@ -112,10 +114,8 @@ INTENT_VALUES = {
 }
 
 ROUTER_CONTEXT_CACHE_SECONDS = 300
-ROUTER_REQUEST_TIMEOUT_SECONDS = 90
 _ROUTER_CONTEXT: RouterContext | None = None
-_ROUTER_HTTP: requests.Session | None = None
-LOCALE_DIR = Path(os.getenv("FIREFLY_BOT_LOCALE_DIR", str(Path(os.getenv("OPENCLAW_WORKSPACE", "workspace")) / "i18n")))
+LOCALE_DIR = Path(os.getenv("FIREFLY_BOT_LOCALE_DIR", str(Path(os.getenv("PICOCLAW_WORKSPACE", "workspace")) / "i18n")))
 
 COMMON_TEXT_NORMALIZATIONS = (
     ("mistrami", "mostrami"),
@@ -363,6 +363,8 @@ def coerce_transaction_date(value: Any) -> str | None:
     raw = str(value or "").strip()
     if not raw:
         return None
+    if re.match(r"^\d{4}-\d{2}-\d{2}T", raw):
+        return raw[:10]
     parsed = parse_flexible_date(raw)
     if parsed is not None:
         return parsed.isoformat()
@@ -538,6 +540,9 @@ COMMAND_ALIASES: dict[str, str] = {
     "/aiuto":        "/help",
     "/comandi":      "/commands",
     "/configura":    "/setup",
+    "/training":     "/train",
+    "/allena":       "/train",
+    "/impara":       "/train",
     "/aggiungi":     "/add",
     "/saldi":        "/balances",
     "/riepilogo":    "/summary",
@@ -567,6 +572,7 @@ def ensure_telegram_commands(bot_token: str) -> None:
     commands_en = [
         {"command": "help", "description": "Help and examples"},
         {"command": "commands", "description": "Full command list"},
+        {"command": "train", "description": "Teach account aliases and defaults"},
         {"command": "setup", "description": "Setup account/budget profile"},
         {"command": "add", "description": "Interactive transaction add"},
         {"command": "balances", "description": "Show balances"},
@@ -581,6 +587,7 @@ def ensure_telegram_commands(bot_token: str) -> None:
     commands_it = [
         {"command": "help", "description": "Aiuto ed esempi"},
         {"command": "commands", "description": "Lista comandi completa"},
+        {"command": "train", "description": "Insegna alias conti e default"},
         {"command": "setup", "description": "Configura profilo conti/budget"},
         {"command": "add", "description": "Aggiunta transazione guidata"},
         {"command": "balances", "description": "Mostra saldi"},
@@ -836,9 +843,11 @@ def format_income_vs_spending(label: str, summary: dict[str, Any], *, source_tex
 def format_transaction_preview(payload: dict[str, Any], *, intro: str, outro: str, source_text: str | None = None) -> str:
     tx = (payload.get("transactions") or [{}])[0]
     date_value = format_display_date(str(tx.get("date", ""))[:10])
+    type_label = localized_transaction_type(tx.get("type", "transaction"), source_text=source_text)
+    amount_label = format_money(tx.get("amount"))
     headline = localize(
-        f"{tx.get('type', 'transaction')} {tx.get('amount', '?')} on {date_value}",
-        f"{tx.get('type', 'transaction')} {tx.get('amount', '?')} del {date_value}",
+        f"{type_label} {amount_label} on {date_value}",
+        f"{type_label} {amount_label} del {date_value}",
         source_text=source_text,
     )
     return (
@@ -865,7 +874,7 @@ def format_transaction_batch_preview(
             + " | ".join(
                 [
                     format_display_date(str(tx.get("date", ""))[:10]),
-                    str(tx.get("amount") or "?"),
+                    format_money(tx.get("amount")),
                     str(tx.get("description") or "No description"),
                     str(tx.get("category_name") or "-"),
                 ]
@@ -903,9 +912,11 @@ def format_created_transaction_result(
         if transactions:
             tx = transactions[0]
             date_value = format_display_date(str(tx.get("date", ""))[:10])
+            type_label = localized_transaction_type(tx.get("type", "transaction"), source_text=source_text)
+            amount_label = format_money(tx.get("amount"))
             headline = localize(
-                f"{tx.get('type', 'transaction')} {tx.get('amount', '?')} on {date_value}",
-                f"{tx.get('type', 'transaction')} {tx.get('amount', '?')} del {date_value}",
+                f"{type_label} {amount_label} on {date_value}",
+                f"{type_label} {amount_label} del {date_value}",
                 source_text=source_text,
             )
             return (
@@ -1001,6 +1012,13 @@ def account_choice_list(service: BridgeService, *, limit: int = 12) -> list[str]
     return summarize_name_list(service.client.list_accounts("all"), limit=limit)
 
 
+def usable_account_name(value: Any) -> str:
+    name = str(value or "").strip()
+    if normalize_natural_text(name) in {"account", "accounts", "conto", "conti"}:
+        return ""
+    return name
+
+
 def parse_yes_no(value: str) -> bool | None:
     lowered = normalize_natural_text(value)
     if lowered in {"yes", "y", "si", "sì", "ok", "auto", "true"}:
@@ -1046,6 +1064,15 @@ def finance_profile_summary(state: dict[str, Any], *, source_text: str | None = 
     ):
         value = str(profile.get(key) or "-").strip() or "-"
         lines.append(f"- {localize(label_en, label_it, source_text=source_text)}: {value}")
+    payment_accounts = profile.get("payment_method_accounts")
+    if isinstance(payment_accounts, dict):
+        for method, label_en, label_it in (
+            ("card", "When I say card", "Quando dico carta"),
+            ("cash", "When I say cash", "Quando dico contanti"),
+            ("app", "When I say app", "Quando dico app"),
+        ):
+            value = str(payment_accounts.get(method) or "-").strip() or "-"
+            lines.append(f"- {localize(label_en, label_it, source_text=source_text)}: {value}")
     lines.append(
         f"- {localize('Ask budget when missing', 'Chiedi budget se manca', source_text=source_text)}: "
         f"{'yes' if bool(profile.get('ask_budget_when_missing', True)) else 'no'}"
@@ -1079,26 +1106,38 @@ def build_finance_setup_prompt(service: BridgeService, state: dict[str, Any], *,
         "expense_destination_account",
         "income_source_account",
         "income_destination_account",
+        "card_payment_account",
+        "cash_payment_account",
     }:
         prompt_map = {
             "expense_source_account": localize(
-                "Setup 1/6. Which account should I use as source for expenses (money out)?",
-                "Setup 1/6. Quale conto devo usare come sorgente per le spese (soldi in uscita)?",
+                "Training 1/8. Which account should I use when money goes out by default?",
+                "Training 1/8. Quale conto devo usare di default quando i soldi escono?",
                 source_text=source_text,
             ),
             "expense_destination_account": localize(
-                "Setup 2/6. Which destination account should I use for expenses (merchant side)?",
-                "Setup 2/6. Quale conto destinazione devo usare per le spese (controparte/esercente)?",
+                "Training 2/8. Which destination account should I use for expenses (merchant side)?",
+                "Training 2/8. Quale conto destinazione devo usare per le spese (controparte/esercente)?",
                 source_text=source_text,
             ),
             "income_source_account": localize(
-                "Setup 3/6. Optional: default source account for incomes. Reply 'skip' to leave empty.",
-                "Setup 3/6. Opzionale: conto sorgente predefinito per entrate. Rispondi 'skip' per lasciare vuoto.",
+                "Training 3/8. Optional: default source account for incomes. Reply 'skip' to leave empty.",
+                "Training 3/8. Opzionale: conto sorgente predefinito per entrate. Rispondi 'skip' per lasciare vuoto.",
                 source_text=source_text,
             ),
             "income_destination_account": localize(
-                "Setup 4/6. Which account receives income by default?",
-                "Setup 4/6. Quale conto riceve le entrate di default?",
+                "Training 4/8. Which account receives income by default?",
+                "Training 4/8. Quale conto riceve le entrate di default?",
+                source_text=source_text,
+            ),
+            "card_payment_account": localize(
+                "Training 5/8. When you say 'card', which account should I use? Reply 'skip' if none.",
+                "Training 5/8. Quando dici 'carta', quale conto devo usare? Rispondi 'skip' se nessuno.",
+                source_text=source_text,
+            ),
+            "cash_payment_account": localize(
+                "Training 6/8. When you say 'cash/contanti', which account should I use? Reply 'skip' if none.",
+                "Training 6/8. Quando dici 'contanti/cash', quale conto devo usare? Rispondi 'skip' se nessuno.",
                 source_text=source_text,
             ),
         }
@@ -1128,6 +1167,16 @@ def build_finance_setup_prompt(service: BridgeService, state: dict[str, Any], *,
                 "Esempio: stipendio/bonifico in entrata arriva su questo conto.",
                 source_text=source_text,
             ),
+            "card_payment_account": localize(
+                "Example: 'coffee paid by card' uses this as the source account.",
+                "Esempio: 'caffe pagato con carta' usa questo come conto sorgente.",
+                source_text=source_text,
+            ),
+            "cash_payment_account": localize(
+                "Example: 'coffee cash' uses this as the source account.",
+                "Esempio: 'caffe in contanti' usa questo come conto sorgente.",
+                source_text=source_text,
+            ),
         }
         lines.append(examples[step])
         lines.append(localize("Reply with account name or number.", "Rispondi con nome conto o numero.", source_text=source_text))
@@ -1135,14 +1184,14 @@ def build_finance_setup_prompt(service: BridgeService, state: dict[str, Any], *,
 
     if step == "ask_budget_when_missing":
         return localize(
-            "Setup 5/6. If budget is unclear, should I always ask before saving? (yes/no)\nExample: coffee could be Bar or Cibo.",
-            "Setup 5/6. Se il budget e incerto, devo sempre chiedere prima di salvare? (si/no)\nEsempio: un caffe puo stare in Bar o Cibo.",
+            "Training 7/8. If budget is unclear, should I always ask before saving? (yes/no)\nExample: coffee could be Bar or Cibo.",
+            "Training 7/8. Se il budget e incerto, devo sempre chiedere prima di salvare? (si/no)\nEsempio: un caffe puo stare in Bar o Cibo.",
             source_text=source_text,
         )
 
     return localize(
-        "Setup 6/6. Should I auto-assign budget from similar past transactions? (yes/no)\nExample: recurring supermarket expenses inherit the same budget.",
-        "Setup 6/6. Vuoi che assegni automaticamente il budget da transazioni passate simili? (si/no)\nEsempio: spese ricorrenti al supermercato ereditano lo stesso budget.",
+        "Training 8/8. Should I auto-assign budget from similar past transactions? (yes/no)\nExample: recurring supermarket expenses inherit the same budget.",
+        "Training 8/8. Vuoi che assegni automaticamente il budget da transazioni passate simili? (si/no)\nEsempio: spese ricorrenti al supermercato ereditano lo stesso budget.",
         source_text=source_text,
     )
 
@@ -1173,9 +1222,16 @@ def handle_finance_setup_message(service: BridgeService, state: dict[str, Any], 
         "expense_destination_account",
         "income_source_account",
         "income_destination_account",
+        "card_payment_account",
+        "cash_payment_account",
     }:
-        if step == "income_source_account" and normalize_natural_text(answer) in {"skip", "salta", "none", "nessuno"}:
-            profile["income_source_account"] = None
+        if step in {"income_source_account", "card_payment_account", "cash_payment_account"} and normalize_natural_text(answer) in {"skip", "salta", "none", "nessuno"}:
+            if step == "income_source_account":
+                profile["income_source_account"] = None
+            else:
+                payment_accounts = dict(profile.get("payment_method_accounts") or {})
+                payment_accounts.pop("card" if step == "card_payment_account" else "cash", None)
+                profile["payment_method_accounts"] = payment_accounts
         else:
             resolved = match_choice(answer, account_options)
             if not resolved:
@@ -1186,7 +1242,16 @@ def handle_finance_setup_message(service: BridgeService, state: dict[str, Any], 
                         source_text=text,
                     )
                 )
-            profile[step] = resolved
+            if step == "card_payment_account":
+                payment_accounts = dict(profile.get("payment_method_accounts") or {})
+                payment_accounts["card"] = resolved
+                profile["payment_method_accounts"] = payment_accounts
+            elif step == "cash_payment_account":
+                payment_accounts = dict(profile.get("payment_method_accounts") or {})
+                payment_accounts["cash"] = resolved
+                profile["payment_method_accounts"] = payment_accounts
+            else:
+                profile[step] = resolved
     elif step == "ask_budget_when_missing":
         parsed = parse_yes_no(answer)
         if parsed is None:
@@ -1205,8 +1270,8 @@ def handle_finance_setup_message(service: BridgeService, state: dict[str, Any], 
         state.pop("profile_setup", None)
         summary = finance_profile_summary(state, source_text=text)
         outro = localize(
-            "Setup complete. I'll use this profile for auto-assignments and ask when uncertain.",
-            "Setup completato. Usero questo profilo per auto-assegnare e chiedero quando incerto.",
+            "Training complete. I'll use this profile for account aliases, auto-assignments, and questions when uncertain.",
+            "Training completato. Usero questo profilo per alias dei conti, auto-assegnazioni e domande quando sono incerto.",
             source_text=text,
         )
         return BotResponse(f"{summary}\n\n{outro}")
@@ -2765,124 +2830,25 @@ def extract_json_object(raw: str) -> dict[str, Any]:
     return json.loads(raw[start : end + 1])
 
 
-def get_router_http() -> requests.Session:
-    global _ROUTER_HTTP
-    if _ROUTER_HTTP is None:
-        _ROUTER_HTTP = requests.Session()
-    return _ROUTER_HTTP
-
-
-def router_gateway_url() -> str:
-    port = os.getenv("OPENCLAW_PORT", "18789").strip() or "18789"
-    base = os.getenv("OPENCLAW_ROUTER_BASE_URL", f"http://127.0.0.1:{port}").rstrip("/")
-    return f"{base}/v1/responses"
-
-
-def router_gateway_headers() -> dict[str, str]:
-    token = os.getenv("OPENCLAW_GATEWAY_TOKEN", "").strip()
-    if not token:
-        raise RouterGatewayError("OPENCLAW_GATEWAY_TOKEN is missing for the router.")
-    return {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json",
-        "X-OpenClaw-Agent-Id": "main",
-    }
-
-
-def router_model_name() -> str:
-    return os.getenv("OPENCLAW_DEFAULT_MODEL", "openai-codex/gpt-5.4").strip() or "openai-codex/gpt-5.4"
-
-
-def router_session_user(state: dict[str, Any]) -> str:
-    owner_id = os.getenv("FIREFLY_TELEGRAM_OWNER_ID", os.getenv("TELEGRAM_OWNER_ID", "owner")).strip() or "owner"
-    epoch = int(state.get("router_session_epoch", 0) or 0)
-    return f"telegram-router-{owner_id}-v{epoch}"
-
-
 def reset_router_session(state: dict[str, Any]) -> None:
     state["router_session_epoch"] = int(state.get("router_session_epoch", 0) or 0) + 1
     state.pop("router_previous_response_id", None)
     state["router_consecutive_failures"] = 0
 
 
-def extract_router_text(response_payload: dict[str, Any]) -> str:
-    output_text = response_payload.get("output_text")
-    if isinstance(output_text, str) and output_text.strip():
-        return output_text
-
-    chunks: list[str] = []
-    output = response_payload.get("output")
-    if isinstance(output, list):
-        for item in output:
-            if not isinstance(item, dict):
-                continue
-            content = item.get("content")
-            if isinstance(content, list):
-                for part in content:
-                    if not isinstance(part, dict):
-                        continue
-                    text_value = part.get("text")
-                    if isinstance(text_value, str) and text_value.strip():
-                        chunks.append(text_value)
-                        continue
-                    if isinstance(text_value, dict):
-                        value = text_value.get("value")
-                        if isinstance(value, str) and value.strip():
-                            chunks.append(value)
-            text_value = item.get("text")
-            if isinstance(text_value, str) and text_value.strip():
-                chunks.append(text_value)
-
-    text = "\n".join(chunk.strip() for chunk in chunks if chunk.strip()).strip()
-    if not text:
-        raise RouterGatewayError("Router gateway returned no text output.")
-    return text
-
-
-def gateway_responses_request(payload: dict[str, Any]) -> dict[str, Any]:
-    try:
-        response = get_router_http().post(
-            router_gateway_url(),
-            headers=router_gateway_headers(),
-            json=payload,
-            timeout=(10, ROUTER_REQUEST_TIMEOUT_SECONDS),
-        )
-    except RequestException as exc:
-        raise RouterGatewayError(f"Router gateway request failed: {exc}") from exc
-
-    try:
-        response_payload = response.json()
-    except ValueError as exc:
-        raise RouterGatewayError(f"Router gateway returned non-JSON data: {response.text[:300]}") from exc
-
-    if response.status_code >= 400:
-        raise RouterGatewayError(str(response_payload))
-    return response_payload
-
-
 def perform_router_request(service: BridgeService, text: str, state: dict[str, Any]) -> dict[str, Any]:
     instructions = build_router_instructions(service)
-    payload: dict[str, Any] = {
-        "model": router_model_name(),
-        "input": text,
-        "instructions": instructions,
-        "user": router_session_user(state),
-        "max_output_tokens": 400,
-        "store": False,
-    }
-
-    response_payload = gateway_responses_request(payload)
-    raw_text = extract_router_text(response_payload)
+    raw_text = call_ai_text(instructions, text, max_tokens=400)
     payload = extract_json_object(raw_text)
     state["router_consecutive_failures"] = 0
     return payload
 
 
-def run_openclaw_router(service: BridgeService, text: str, state: dict[str, Any]) -> dict[str, Any] | None:
+def run_picoclaw_router(service: BridgeService, text: str, state: dict[str, Any]) -> dict[str, Any] | None:
     for attempt in range(2):
         try:
             payload = perform_router_request(service, text, state)
-        except (RouterGatewayError, ValueError, json.JSONDecodeError):
+        except (AIRouterGatewayError, ValueError, json.JSONDecodeError):
             state["router_consecutive_failures"] = int(state.get("router_consecutive_failures", 0) or 0) + 1
             if attempt == 0:
                 reset_router_session(state)
@@ -2945,14 +2911,14 @@ def use_pdfapihub_ocr_provider() -> bool:
     return raw not in {"0", "false", "no", "off"}
 
 
-def openclaw_pdf_ocr_plugin_command() -> str:
+def external_pdf_ocr_plugin_command() -> str:
     # Optional compatibility hook for custom OCR wrappers.
     # Example: "my-ocr-cli --file {file} --mime {mime}"
     return os.getenv("FIREFLY_PDF_OCR_PLUGIN_CMD", "").strip()
 
 
-def run_openclaw_pdf_ocr_plugin(image_bytes: bytes, *, mime_type: str, file_name: str | None = None) -> str | None:
-    command = openclaw_pdf_ocr_plugin_command()
+def run_external_pdf_ocr_plugin(image_bytes: bytes, *, mime_type: str, file_name: str | None = None) -> str | None:
+    command = external_pdf_ocr_plugin_command()
     if not command:
         return None
 
@@ -3056,7 +3022,7 @@ def extract_text_from_pdfapihub_payload(payload: Any) -> str | None:
 def run_pdfapihub_ocr(image_bytes: bytes, *, mime_type: str, file_name: str | None = None) -> str | None:
     if not use_pdfapihub_ocr_provider():
         return None
-    plugin_text = run_openclaw_pdf_ocr_plugin(image_bytes, mime_type=mime_type, file_name=file_name)
+    plugin_text = run_external_pdf_ocr_plugin(image_bytes, mime_type=mime_type, file_name=file_name)
     if plugin_text:
         return plugin_text
     api_key = pdfapihub_api_key()
@@ -3139,37 +3105,22 @@ def select_best_ocr_text(*candidates: str | None) -> str | None:
 def run_receipt_ai_ocr(image_bytes: bytes, *, mime_type: str) -> str | None:
     if not use_ai_ocr():
         return None
+    instructions = (
+        "You are an OCR transcriber for finance receipts and bank screenshots.\n"
+        "Return only plain text that is visibly readable from the image.\n"
+        "Do not summarize or explain.\n"
+        "Preserve amounts, dates, merchants, and currency tokens exactly.\n"
+        "If text is unreadable, return an empty string."
+    )
     try:
-        router_gateway_headers()
-    except RouterGatewayError:
-        return None
-
-    encoded = base64.b64encode(image_bytes).decode("ascii")
-    payload: dict[str, Any] = {
-        "model": router_model_name(),
-        "instructions": (
-            "You are an OCR transcriber for finance receipts and bank screenshots.\n"
-            "Return only plain text that is visibly readable from the image.\n"
-            "Do not summarize or explain.\n"
-            "Preserve amounts, dates, merchants, and currency tokens exactly.\n"
-            "If text is unreadable, return an empty string."
-        ),
-        "input": [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "input_text", "text": "Transcribe this image as plain text lines."},
-                    {"type": "input_image", "image_url": f"data:{mime_type};base64,{encoded}"},
-                ],
-            }
-        ],
-        "max_output_tokens": 1200,
-        "store": False,
-    }
-    try:
-        response_payload = gateway_responses_request(payload)
-        extracted = extract_router_text(response_payload)
-    except (RouterGatewayError, ValueError):
+        extracted = call_ai_vision(
+            instructions,
+            "Transcribe this image as plain text lines.",
+            image_bytes,
+            mime_type=mime_type,
+            max_tokens=1200,
+        )
+    except (AIRouterGatewayError, ValueError):
         return None
     return normalize_ai_ocr_text(extracted)
 
@@ -3497,7 +3448,6 @@ def run_receipt_router(
     extracted_text: str | None = None,
 ) -> dict[str, Any] | None:
     context = get_router_context(service)
-    encoded = base64.b64encode(image_bytes).decode("ascii")
     instructions = (
         "You are FireflyClaw extracting a receipt or financial document for a Firefly III finance bot.\n"
         "Prioritize reliability over detail.\n"
@@ -3523,25 +3473,11 @@ def run_receipt_router(
     if extracted_text:
         parts.append(f"OCR text:\n{extracted_text}")
     user_text = "\n\n".join(part for part in parts if part)
-    payload = {
-        "model": router_model_name(),
-        "instructions": instructions,
-        "input": [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "input_text", "text": user_text},
-                    {"type": "input_image", "image_url": f"data:{mime_type};base64,{encoded}"},
-                ],
-            }
-        ],
-        "store": False,
-    }
 
     try:
-        response_payload = gateway_responses_request(payload)
-        parsed = extract_json_object(extract_router_text(response_payload))
-    except (RouterGatewayError, ValueError, json.JSONDecodeError):
+        raw_text = call_ai_vision(instructions, user_text, image_bytes, mime_type=mime_type, max_tokens=1200)
+        parsed = extract_json_object(raw_text)
+    except (AIRouterGatewayError, ValueError, json.JSONDecodeError):
         return None
 
     intent = str(parsed.get("intent", "")).strip()
@@ -3644,7 +3580,7 @@ def _export_all_transactions(client: FireflyClient) -> list[dict[str, Any]]:
 def create_firefly_backup_document(service: BridgeService) -> tuple[str, str, dict[str, Any]]:
     exported_at = datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
     backup: dict[str, Any] = {
-        "format": "firefly-openclaw-companion-backup/v1",
+        "format": "firefly-picoclaw-companion-backup/v1",
         "exported_at": exported_at,
         "source": "telegram /backup",
         "data": {},
@@ -3698,6 +3634,28 @@ def parse_amount_from_text(text: str) -> str | None:
     return match.group(1).replace(",", ".")
 
 
+def format_money(value: Any, *, currency: str = "EUR ") -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return f"{currency}?"
+    try:
+        amount = Decimal(raw.replace(",", "."))
+    except Exception:
+        return f"{currency}{raw}"
+    return f"{currency}{amount.quantize(Decimal('0.01'))}"
+
+
+def localized_transaction_type(value: Any, *, source_text: str | None = None) -> str:
+    transaction_type = str(value or "").strip()
+    labels = {
+        "withdrawal": ("Expense", "Spesa"),
+        "deposit": ("Income", "Entrata"),
+        "transfer": ("Transfer", "Trasferimento"),
+    }
+    en, it = labels.get(transaction_type, (transaction_type or "Transaction", transaction_type or "Transazione"))
+    return localize(en, it, source_text=source_text)
+
+
 def contains_any(text: str, keywords: set[str] | tuple[str, ...]) -> bool:
     return any(keyword in text for keyword in keywords)
 
@@ -3708,10 +3666,24 @@ def clean_free_text_slot(value: str | None) -> str | None:
     cleaned = " ".join(value.rstrip(" .,!?:;").split())
     if not cleaned:
         return None
-    cleaned = re.sub(r"\b(?:paid|made)\s+with\s+(?:cash|contanti)\b.*$", "", cleaned, flags=re.IGNORECASE)
-    cleaned = re.sub(r"\b(?:in\s*cash|cash|contanti|i\s*n\s*cash)\b.*$", "", cleaned, flags=re.IGNORECASE)
+    payment_words = r"cash|contanti|contante|card|carta|bancomat|debit(?:o)?|credit(?:o)?|visa|mastercard|paypal|revolut|wise"
+    cleaned = re.sub(rf"\b(?:paid|made|pagato|pagata|pagati|pagate)\s+(?:with|con)\s+(?:{payment_words})\b.*$", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(rf"\b(?:with|con|in)\s+(?:{payment_words})\b.*$", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\b(?:today|oggi|yesterday|ieri|tomorrow|domani)\b.*$", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\b(?:on|il|del|della)\s+\d{1,2}[/-]\d{1,2}(?:[/-]\d{2,4})?\b.*$", "", cleaned, flags=re.IGNORECASE)
     cleaned = " ".join(cleaned.strip(" .,!?:;").split())
     return cleaned or None
+
+
+def clean_transaction_description(description: str, *, source_text: str | None = None, merchant: str | None = None) -> str:
+    cleaned = clean_free_text_slot(description)
+    if cleaned:
+        return cleaned
+    merchant_clean = clean_free_text_slot(merchant)
+    if merchant_clean:
+        return merchant_clean
+    source_clean = clean_free_text_slot(source_text)
+    return source_clean or description.strip()
 
 
 def unique_preserving_order(values: list[str]) -> list[str]:
@@ -4182,7 +4154,12 @@ def interpret_natural_command(text: str) -> str | None:
     return None
 
 
-def infer_account_from_payment_method(service: BridgeService, description: str, locale: str = "en") -> str | None:
+def infer_account_from_payment_method(
+    service: BridgeService,
+    description: str,
+    locale: str = "en",
+    state: dict[str, Any] | None = None,
+) -> str | None:
     """Try to infer account from payment method keywords in description.
 
     Returns account name or None if no good match found.
@@ -4190,6 +4167,14 @@ def infer_account_from_payment_method(service: BridgeService, description: str, 
     payment_method = extract_payment_method(description, locale=locale)
     if not payment_method:
         return None
+
+    if state is not None:
+        profile = get_finance_profile(state)
+        payment_accounts = profile.get("payment_method_accounts")
+        if isinstance(payment_accounts, dict):
+            configured = str(payment_accounts.get(payment_method) or "").strip()
+            if configured:
+                return configured
 
     # Map payment methods to account type patterns
     type_patterns = {
@@ -4208,10 +4193,12 @@ def infer_account_from_payment_method(service: BridgeService, description: str, 
         attrs = account.get("attributes") or {}
         account_type = str(attrs.get("type") or "").strip().lower()
         account_name = str(attrs.get("name") or "").strip()
+        account_name_folded = normalize_natural_text(account_name)
         if not account_name:
             continue
         for pattern in patterns:
-            if pattern.lower() in account_type:
+            pattern_folded = normalize_natural_text(pattern)
+            if pattern.lower() in account_type or pattern_folded in account_name_folded:
                 return account_name
 
     return None
@@ -4599,8 +4586,9 @@ def execute_intent(service: BridgeService, payload: dict[str, Any], state: dict[
         rules = service.resolve_merchant_rule(str(params.get("merchant") or "").strip() or None)
         inferred_account = infer_account_from_payment_method(
             service,
-            description,
+            " ".join(part for part in [source_text or "", description] if part),
             locale=locale_language(source_text),
+            state=state,
         )
         if transaction_kind == "withdrawal" and inferred_account and not str(params.get("source") or "").strip():
             params["source"] = inferred_account
@@ -4609,23 +4597,39 @@ def execute_intent(service: BridgeService, payload: dict[str, Any], state: dict[
 
         missing_fields: list[str] = []
         if transaction_kind == "withdrawal":
-            effective_source = str(params.get("source") or defaults.get("expense_source_account") or "").strip()
-            effective_destination = str(params.get("destination") or rules.get("destination_account") or defaults.get("expense_destination_account") or "").strip()
+            effective_source = usable_account_name(params.get("source") or defaults.get("expense_source_account"))
+            effective_destination = usable_account_name(params.get("destination") or rules.get("destination_account") or defaults.get("expense_destination_account"))
+            if effective_source:
+                params["source"] = effective_source
+            else:
+                params.pop("source", None)
+            if effective_destination:
+                params["destination"] = effective_destination
+            else:
+                params.pop("destination", None)
             if not effective_source:
                 missing_fields.append("source")
             if not effective_destination:
                 missing_fields.append("destination")
         elif transaction_kind == "deposit":
-            effective_source = str(params.get("source") or rules.get("source_account") or defaults.get("income_source_account") or "").strip()
-            effective_destination = str(params.get("destination") or defaults.get("income_destination_account") or "").strip()
+            effective_source = usable_account_name(params.get("source") or rules.get("source_account") or defaults.get("income_source_account"))
+            effective_destination = usable_account_name(params.get("destination") or defaults.get("income_destination_account"))
+            if effective_source:
+                params["source"] = effective_source
+            else:
+                params.pop("source", None)
+            if effective_destination:
+                params["destination"] = effective_destination
+            else:
+                params.pop("destination", None)
             if not effective_source:
                 missing_fields.append("source")
             if not effective_destination:
                 missing_fields.append("destination")
         else:
-            if not str(params.get("source") or "").strip():
+            if not usable_account_name(params.get("source")):
                 missing_fields.append("source")
-            if not str(params.get("destination") or "").strip():
+            if not usable_account_name(params.get("destination")):
                 missing_fields.append("destination")
         if missing_fields:
             queued_payload = {
@@ -4640,6 +4644,13 @@ def execute_intent(service: BridgeService, payload: dict[str, Any], state: dict[
                 fields=missing_fields,
                 source_text=source_text,
             )
+
+        description = clean_transaction_description(
+            description,
+            source_text=source_text,
+            merchant=str(params.get("merchant") or "").strip() or None,
+        )
+        params["description"] = description
 
         # Try fuzzy-match account names for transfers
         if transaction_kind == "transfer":
@@ -4749,8 +4760,9 @@ def execute_intent(service: BridgeService, payload: dict[str, Any], state: dict[
             rules = service.resolve_merchant_rule(str(item_params.get("merchant") or "").strip() or None)
             inferred_account = infer_account_from_payment_method(
                 service,
-                description,
+                " ".join(part for part in [source_text or "", description] if part),
                 locale=locale_language(source_text),
+                state=state,
             )
             if transaction_kind == "withdrawal" and inferred_account and not str(item_params.get("source") or "").strip():
                 item_params["source"] = inferred_account
@@ -4758,14 +4770,30 @@ def execute_intent(service: BridgeService, payload: dict[str, Any], state: dict[
                 item_params["destination"] = inferred_account
 
             if transaction_kind == "withdrawal":
-                effective_source = str(item_params.get("source") or defaults.get("expense_source_account") or "").strip()
-                effective_destination = str(item_params.get("destination") or rules.get("destination_account") or defaults.get("expense_destination_account") or "").strip()
+                effective_source = usable_account_name(item_params.get("source") or defaults.get("expense_source_account"))
+                effective_destination = usable_account_name(item_params.get("destination") or rules.get("destination_account") or defaults.get("expense_destination_account"))
+                if effective_source:
+                    item_params["source"] = effective_source
+                else:
+                    item_params.pop("source", None)
+                if effective_destination:
+                    item_params["destination"] = effective_destination
+                else:
+                    item_params.pop("destination", None)
             elif transaction_kind == "deposit":
-                effective_source = str(item_params.get("source") or rules.get("source_account") or defaults.get("income_source_account") or "").strip()
-                effective_destination = str(item_params.get("destination") or defaults.get("income_destination_account") or "").strip()
+                effective_source = usable_account_name(item_params.get("source") or rules.get("source_account") or defaults.get("income_source_account"))
+                effective_destination = usable_account_name(item_params.get("destination") or defaults.get("income_destination_account"))
+                if effective_source:
+                    item_params["source"] = effective_source
+                else:
+                    item_params.pop("source", None)
+                if effective_destination:
+                    item_params["destination"] = effective_destination
+                else:
+                    item_params.pop("destination", None)
             else:
-                effective_source = str(item_params.get("source") or "").strip()
-                effective_destination = str(item_params.get("destination") or "").strip()
+                effective_source = usable_account_name(item_params.get("source"))
+                effective_destination = usable_account_name(item_params.get("destination"))
 
             if not effective_source or not effective_destination:
                 return BotResponse(
@@ -4776,6 +4804,12 @@ def execute_intent(service: BridgeService, payload: dict[str, Any], state: dict[
                     )
                 )
             # Try fuzzy-match category if not explicitly set
+            description = clean_transaction_description(
+                description,
+                source_text=source_text,
+                merchant=str(item_params.get("merchant") or "").strip() or None,
+            )
+            item_params["description"] = description
             if not str(item_params.get("category") or "").strip():
                 try:
                     available_categories = [
@@ -5233,7 +5267,7 @@ def process_message(service: BridgeService, text: str, state: dict[str, Any]) ->
         else:
             ai_payload = None
             if router_health.check():
-                ai_payload = run_openclaw_router(service, text, state)
+                ai_payload = run_picoclaw_router(service, text, state)
             if ai_payload is None and not router_health.check():
                 natural_payload = parse_natural_intent_payload(text)
                 if natural_payload is not None:
@@ -5283,7 +5317,15 @@ def process_message(service: BridgeService, text: str, state: dict[str, Any]) ->
     command = COMMAND_ALIASES.get(command, command)
     tail = parts[1] if len(parts) > 1 else ""
 
-    if command in {"/start", "/help"}:
+    if command == "/start":
+        profile = get_finance_profile(state)
+        payment_accounts = profile.get("payment_method_accounts")
+        has_card_alias = isinstance(payment_accounts, dict) and bool(str(payment_accounts.get("card") or "").strip())
+        if not finance_profile_ready(state) or not has_card_alias:
+            return start_finance_setup(service, state, source_text=text)
+        return BotResponse(help_text(text))
+
+    if command == "/help":
         return BotResponse(help_text(text))
 
     if command in {"/command", "/commands"}:
@@ -5328,7 +5370,7 @@ def process_message(service: BridgeService, text: str, state: dict[str, Any]) ->
         start_maintenance_mode(state, source_text=text)
         return BotResponse(maintenance_menu_text(source_text=text))
 
-    if command == "/setup":
+    if command in {"/setup", "/train"}:
         action = normalize_natural_text(tail)
         if action == "status":
             return BotResponse(finance_profile_summary(state, source_text=text))
@@ -5336,7 +5378,7 @@ def process_message(service: BridgeService, text: str, state: dict[str, Any]) ->
             state.pop("finance_profile", None)
             state.pop("profile_setup", None)
             return start_finance_setup(service, state, source_text=text)
-        if finance_profile_ready(state) and action not in {"", "start"}:
+        if command == "/setup" and finance_profile_ready(state) and action not in {"", "start"}:
             return BotResponse(finance_profile_summary(state, source_text=text))
         return start_finance_setup(service, state, source_text=text)
 

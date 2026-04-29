@@ -1,14 +1,13 @@
-"""AI router interaction.
+"""AI router - direct provider calls.
 
-Handles calling the OpenClaw AI gateway for natural language understanding
-when deterministic regex parsing fails, and handles screenshot analysis
-via Vision models.
-
-The gateway is accessed directly via HTTP using env vars:
-  OPENCLAW_ROUTER_BASE_URL  (default: http://127.0.0.1:{OPENCLAW_PORT})
-  OPENCLAW_PORT             (default: 18789)
-  OPENCLAW_GATEWAY_TOKEN    (required)
-  OPENCLAW_DEFAULT_MODEL    (default: openai-codex/gpt-5.4)
+Calls AI providers directly for text inference and vision.
+Env vars:
+  PICOCLAW_DEFAULT_MODEL  provider/model-name (e.g. gemini/gemini-2.5-flash, anthropic/claude-sonnet-4-6)
+  OPENAI_API_KEY / OPENAI_API_KEYS  (for openai/ and openai-codex/ models)
+  ANTHROPIC_API_KEY       (for anthropic/ models)
+  OPENROUTER_API_KEY      (for openrouter/ models)
+  GROQ_API_KEY            (for groq/ models)
+  GOOGLE_API_KEY          (for google/ models)
 """
 from __future__ import annotations
 
@@ -22,74 +21,178 @@ from requests.exceptions import RequestException
 
 
 class RouterGatewayError(RuntimeError):
-    """Raised when the OpenClaw gateway call fails."""
+    """Raised when an AI provider call fails."""
 
 
 # ---------------------------------------------------------------------------
-# Gateway helpers
+# Provider helpers
 # ---------------------------------------------------------------------------
 
-def _gateway_url() -> str:
-    port = os.getenv("OPENCLAW_PORT", "18789").strip() or "18789"
-    base = os.getenv("OPENCLAW_ROUTER_BASE_URL", f"http://127.0.0.1:{port}").rstrip("/")
-    return f"{base}/v1/responses"
+def _provider_and_model() -> tuple[str, str]:
+    raw = os.getenv("PICOCLAW_DEFAULT_MODEL", "gemini/gemini-2.5-flash").strip() or "gemini/gemini-2.5-flash"
+    if "/" in raw:
+        provider, model = raw.split("/", 1)
+        return provider.lower(), model
+    return "openai", raw
 
 
-def _gateway_headers() -> dict[str, str]:
-    token = os.getenv("OPENCLAW_GATEWAY_TOKEN", "").strip()
-    if not token:
-        raise RouterGatewayError("OPENCLAW_GATEWAY_TOKEN is not set.")
-    return {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json",
-        "X-OpenClaw-Agent-Id": "main",
+def _api_key_for(provider: str) -> str:
+    if provider in ("openai", "openai-codex"):
+        key = os.getenv("OPENAI_API_KEY", "").strip()
+        if not key:
+            keys_csv = os.getenv("OPENAI_API_KEYS", "").strip()
+            if keys_csv:
+                key = keys_csv.split(",")[0].strip()
+        if not key:
+            raise RouterGatewayError("OPENAI_API_KEY is not set.")
+        return key
+    if provider == "anthropic":
+        key = os.getenv("ANTHROPIC_API_KEY", "").strip()
+        if not key:
+            raise RouterGatewayError("ANTHROPIC_API_KEY is not set.")
+        return key
+    if provider == "openrouter":
+        key = os.getenv("OPENROUTER_API_KEY", "").strip()
+        if not key:
+            raise RouterGatewayError("OPENROUTER_API_KEY is not set.")
+        return key
+    if provider in {"google", "gemini"}:
+        key = os.getenv("GOOGLE_API_KEY", "").strip()
+        if not key:
+            raise RouterGatewayError("GOOGLE_API_KEY is not set.")
+        return key
+    if provider == "groq":
+        key = os.getenv("GROQ_API_KEY", "").strip()
+        if not key:
+            raise RouterGatewayError("GROQ_API_KEY is not set.")
+        return key
+    raise RouterGatewayError(
+        f"Unsupported AI provider: {provider!r}. Set PICOCLAW_DEFAULT_MODEL to a supported format (e.g. gemini/gemini-2.5-flash)."
+    )
+
+
+def _chat_completions_url_for(provider: str) -> str:
+    urls: dict[str, str] = {
+        "openai": "https://api.openai.com/v1/chat/completions",
+        "openai-codex": "https://api.openai.com/v1/chat/completions",
+        "openrouter": "https://openrouter.ai/api/v1/chat/completions",
+        "groq": "https://api.groq.com/openai/v1/chat/completions",
+        "google": "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+        "gemini": "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
     }
+    return urls.get(provider, "https://api.openai.com/v1/chat/completions")
 
 
-def _model_name() -> str:
-    return os.getenv("OPENCLAW_DEFAULT_MODEL", "openai-codex/gpt-5.4").strip() or "openai-codex/gpt-5.4"
+# ---------------------------------------------------------------------------
+# Low-level API helpers
+# ---------------------------------------------------------------------------
 
-
-def _post_gateway(payload: dict[str, Any]) -> dict[str, Any]:
+def _post_chat_completions(
+    model: str,
+    messages: list[dict[str, Any]],
+    url: str,
+    api_key: str,
+    max_tokens: int = 400,
+) -> str:
+    payload: dict[str, Any] = {"model": model, "messages": messages, "max_tokens": max_tokens}
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     try:
-        response = requests.post(
-            _gateway_url(),
-            headers=_gateway_headers(),
+        resp = requests.post(
+            url,
+            headers=headers,
             json=payload,
             timeout=(10, 60),
         )
     except RequestException as exc:
-        raise RouterGatewayError(f"Gateway request failed: {exc}") from exc
+        raise RouterGatewayError(f"Provider request failed: {exc}") from exc
     try:
-        body = response.json()
+        body = resp.json()
     except ValueError as exc:
-        raise RouterGatewayError(f"Gateway returned non-JSON: {response.text[:300]}") from exc
-    if response.status_code >= 400:
+        raise RouterGatewayError(f"Provider returned non-JSON: {resp.text[:300]}") from exc
+    if resp.status_code >= 400:
         raise RouterGatewayError(str(body))
-    return body
+    try:
+        return body["choices"][0]["message"]["content"]
+    except (KeyError, IndexError) as exc:
+        raise RouterGatewayError(f"Unexpected response shape: {body}") from exc
 
 
-def _extract_text(response_body: dict[str, Any]) -> str:
-    output_text = response_body.get("output_text")
-    if isinstance(output_text, str) and output_text.strip():
-        return output_text
-    chunks: list[str] = []
-    for item in response_body.get("output") or []:
-        if not isinstance(item, dict):
-            continue
-        for part in item.get("content") or []:
-            if not isinstance(part, dict):
-                continue
-            text_val = part.get("text")
-            if isinstance(text_val, str) and text_val.strip():
-                chunks.append(text_val)
-        text_val = item.get("text")
-        if isinstance(text_val, str) and text_val.strip():
-            chunks.append(text_val)
-    text = "\n".join(chunk.strip() for chunk in chunks if chunk.strip()).strip()
-    if not text:
-        raise RouterGatewayError("Gateway returned no text output.")
-    return text
+def _post_anthropic(
+    model: str,
+    system: str,
+    user_content: list[dict[str, Any]],
+    api_key: str,
+    max_tokens: int = 400,
+) -> str:
+    payload: dict[str, Any] = {
+        "model": model,
+        "system": system,
+        "messages": [{"role": "user", "content": user_content}],
+        "max_tokens": max_tokens,
+    }
+    headers = {
+        "x-api-key": api_key,
+        "anthropic-version": "2023-06-01",
+        "Content-Type": "application/json",
+    }
+    try:
+        resp = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers=headers,
+            json=payload,
+            timeout=(10, 60),
+        )
+    except RequestException as exc:
+        raise RouterGatewayError(f"Anthropic request failed: {exc}") from exc
+    try:
+        body = resp.json()
+    except ValueError as exc:
+        raise RouterGatewayError(f"Anthropic returned non-JSON: {resp.text[:300]}") from exc
+    if resp.status_code >= 400:
+        raise RouterGatewayError(str(body))
+    try:
+        return body["content"][0]["text"]
+    except (KeyError, IndexError) as exc:
+        raise RouterGatewayError(f"Unexpected Anthropic response: {body}") from exc
+
+
+# ---------------------------------------------------------------------------
+# Public call helpers
+# ---------------------------------------------------------------------------
+
+def call_ai_text(instructions: str, user_text: str, max_tokens: int = 400) -> str:
+    """Call the configured AI provider with a text prompt. Returns the response text."""
+    provider, model = _provider_and_model()
+    api_key = _api_key_for(provider)
+    if provider == "anthropic":
+        return _post_anthropic(model, instructions, [{"type": "text", "text": user_text}], api_key, max_tokens)
+    messages = [{"role": "system", "content": instructions}, {"role": "user", "content": user_text}]
+    return _post_chat_completions(model, messages, _chat_completions_url_for(provider), api_key, max_tokens)
+
+
+def call_ai_vision(
+    instructions: str,
+    user_text: str,
+    image_bytes: bytes,
+    mime_type: str = "image/jpeg",
+    max_tokens: int = 400,
+) -> str:
+    """Call the configured AI provider with an image + text prompt. Returns the response text."""
+    provider, model = _provider_and_model()
+    api_key = _api_key_for(provider)
+    encoded = base64.b64encode(image_bytes).decode("ascii")
+    if provider == "anthropic":
+        user_content: list[dict[str, Any]] = [
+            {"type": "text", "text": user_text},
+            {"type": "image", "source": {"type": "base64", "media_type": mime_type, "data": encoded}},
+        ]
+        return _post_anthropic(model, instructions, user_content, api_key, max_tokens)
+    openai_content: list[dict[str, Any]] = [
+        {"type": "text", "text": user_text},
+        {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{encoded}"}},
+    ]
+    messages = [{"role": "system", "content": instructions}, {"role": "user", "content": openai_content}]
+    return _post_chat_completions(model, messages, _chat_completions_url_for(provider), api_key, max_tokens)
 
 
 def _extract_json(text: str) -> dict[str, Any]:
@@ -104,9 +207,8 @@ def _extract_json(text: str) -> dict[str, Any]:
 # Router health checking
 # ---------------------------------------------------------------------------
 
-
 class RouterHealthCheck:
-    """Monitor router health and auto-disable on repeated failures."""
+    """Track recent AI call failures and auto-disable on repeated errors."""
 
     def __init__(self) -> None:
         self.is_healthy: bool = True
@@ -114,38 +216,38 @@ class RouterHealthCheck:
         self.disabled_until: float = 0
 
     def check(self) -> bool:
-        """Health check: returns True if router is healthy, False if disabled or down."""
         import time
-
         if time.time() < self.disabled_until:
             return False
-
         try:
-            response = requests.get(
-                _gateway_url().replace("/v1/responses", "/health"),
-                headers=_gateway_headers(),
-                timeout=3,
-            )
-            if response.status_code == 200:
-                self.failure_count = 0
-                self.is_healthy = True
-                return True
-        except RequestException:
+            provider, _ = _provider_and_model()
+            _api_key_for(provider)
+            self.is_healthy = True
+            return True
+        except RouterGatewayError:
             self.failure_count += 1
             if self.failure_count >= 3:
                 self.disabled_until = time.time() + 600
+            self.is_healthy = False
+            return False
 
+    def record_failure(self) -> None:
+        import time
+        self.failure_count += 1
+        if self.failure_count >= 3:
+            self.disabled_until = time.time() + 600
         self.is_healthy = False
-        return False
+
+    def record_success(self) -> None:
+        self.failure_count = 0
+        self.is_healthy = True
 
     def status_text(self) -> str:
-        """Return human-readable status."""
         import time
-
         if time.time() < self.disabled_until:
             remaining = int(self.disabled_until - time.time())
             return f"⏸️  Disabled ({remaining}s)"
-        return "🟢 Healthy" if self.is_healthy else "🔴 Down"
+        return "\U0001f7e2 Healthy" if self.is_healthy else "\U0001f534 Down"
 
 
 router_health = RouterHealthCheck()
@@ -155,12 +257,8 @@ router_health = RouterHealthCheck()
 # Public router functions
 # ---------------------------------------------------------------------------
 
-def run_openclaw_router(service: Any, text: str, state: dict[str, Any]) -> dict[str, Any] | None:
-    """Send text to OpenClaw routing completion.
-
-    ``service`` is a BridgeService; ``state`` is the bot's mutable state dict
-    (used for session tracking by the caller, not mutated here).
-    """
+def run_picoclaw_router(service: Any, text: str, state: dict[str, Any]) -> dict[str, Any] | None:
+    """Send text to AI for intent routing. Returns parsed JSON or None on failure."""
     accounts = service.client.list_accounts("all")
     categories = service.client.list_categories()
     budgets = service.client.list_budgets()
@@ -177,17 +275,9 @@ def run_openclaw_router(service: Any, text: str, state: dict[str, Any]) -> dict[
         f"Known category names: {category_names}\n"
         f"Known budget names: {budget_names}\n"
     )
-    payload: dict[str, Any] = {
-        "model": _model_name(),
-        "input": text,
-        "instructions": instructions,
-        "max_output_tokens": 400,
-        "store": False,
-    }
 
     try:
-        body = _post_gateway(payload)
-        raw_text = _extract_text(body)
+        raw_text = call_ai_text(instructions, text, max_tokens=400)
         parsed = _extract_json(raw_text)
     except (RouterGatewayError, ValueError, json.JSONDecodeError):
         return None
@@ -206,14 +296,13 @@ def run_receipt_router(
     caption: str | None = None,
     extracted_text: str | None = None,
 ) -> dict[str, Any] | None:
-    """Send receipt image to OpenClaw vision completion."""
+    """Send receipt image to AI vision for parsing."""
     accounts = service.client.list_accounts("all")
     categories = service.client.list_categories()
 
     account_names = [str(x.get("attributes", {}).get("name") or "") for x in accounts]
     category_names = [str(x.get("attributes", {}).get("name") or "") for x in categories]
 
-    encoded = base64.b64encode(image_bytes).decode("ascii")
     instructions = (
         "You are a Firefly III receipt parser. Analyze the image and return ONLY a JSON object.\n"
         "Required fields: intent, confidence, params (with amount, description, merchant, date, category), reply.\n"
@@ -225,24 +314,8 @@ def run_receipt_router(
         parts.append(f"OCR text:\n{extracted_text}")
     user_text = "\n\n".join(part for part in parts if part)
 
-    payload: dict[str, Any] = {
-        "model": _model_name(),
-        "instructions": instructions,
-        "input": [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "input_text", "text": user_text},
-                    {"type": "input_image", "image_url": f"data:{mime_type};base64,{encoded}"},
-                ],
-            }
-        ],
-        "store": False,
-    }
-
     try:
-        body = _post_gateway(payload)
-        raw_text = _extract_text(body)
+        raw_text = call_ai_vision(instructions, user_text, image_bytes, mime_type, max_tokens=400)
         parsed = _extract_json(raw_text)
     except (RouterGatewayError, ValueError, json.JSONDecodeError):
         return None

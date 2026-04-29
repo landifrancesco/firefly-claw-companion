@@ -1,0 +1,67 @@
+{
+  "agents": {
+    "defaults": {
+      "workspace": "/home/picoclaw/.picoclaw/workspace",
+      "restrict_to_workspace": true,
+      "model_name": "gemini",
+      "max_tokens": 8192,
+      "context_window": 131072,
+      "temperature": 0.7,
+      "max_tool_iterations": 20
+    }
+  },
+  "model_list": [
+    {
+      "model_name": "gemini",
+      "model": "gemini/gemini-2.5-flash",
+      "auth_method": "api_key",
+      "api_key": "ref:google_api_key"
+    }
+  ],
+  "channels": {
+    "telegram": {
+      "enabled": false,
+      "token": "ref:telegram_bot_token",
+      "allow_from": [],
+      "use_markdown_v2": false,
+      "streaming": { "enabled": true }
+    }
+  },
+  "tools": {
+    "exec": { "enabled": false },
+    "cron": { "enabled": false },
+    "web": { "enabled": false },
+    "i2c": { "enabled": false },
+    "serial": { "enabled": false },
+    "send_tts": { "enabled": false },
+    "skills": { "enabled": false },
+    "find_skills": { "enabled": false },
+    "install_skill": { "enabled": false },
+    "spawn": { "enabled": true },
+    "subagent": { "enabled": true },
+    "message": { "enabled": true },
+    "list_dir": { "enabled": true },
+    "read_file": { "enabled": true, "mode": "bytes" },
+    "write_file": { "enabled": true },
+    "edit_file": { "enabled": true },
+    "append_file": { "enabled": true },
+    "web_fetch": { "enabled": false },
+    "media_cleanup": { "enabled": true, "max_age_minutes": 30, "interval_minutes": 5 },
+    "mcp": {
+      "enabled": true,
+      "servers": {
+        "firefly-bridge": {
+          "enabled": true,
+          "command": "/opt/firefly-picoclaw/bin/firefly-bridge"
+        }
+      }
+    }
+  },
+  "hooks": { "enabled": true },
+  "heartbeat": { "enabled": true, "interval": 30 },
+  "gateway": {
+    "host": "127.0.0.1",
+    "port": 18790,
+    "log_level": "info"
+  }
+}

@@ -141,7 +141,7 @@ _LOCALE_DIR: Path | None = None
 
 
 def _default_locale_dir() -> Path:
-    workspace = os.getenv("OPENCLAW_WORKSPACE", "")
+    workspace = os.getenv("PICOCLAW_WORKSPACE", "")
     if workspace:
         candidate = Path(workspace) / "i18n"
         if candidate.exists():

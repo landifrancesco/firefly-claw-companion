@@ -13,7 +13,7 @@
     "commands_natural_hint": "Scrivi help se vuoi esempi in linguaggio naturale.",
     "startup_ok": "Firefly bridge sano. Bot pronto. /help mostra cosa puoi chiedermi.",
     "startup_warn": "Firefly bridge avviato con avviso. /help mostra cosa puoi chiedermi.",
-    "startup_gateway_unhealthy": "Sono partito, ma il gateway OpenClaw non e ancora sano su localhost:18789. Controlla i log di docker compose.",
+    "startup_gateway_unhealthy": "Sono partito, ma il gateway PicoClaw non e ancora sano su localhost:18790. Controlla i log di docker compose.",
     "need_more_detail": "Mi serve un po' piu di dettaglio per farlo in sicurezza.",
     "no_pending_draft": "Non c'e nessuna bozza in attesa da confermare.",
     "receipt_unreadable": "Non sono ancora riuscito a leggere quello scontrino in modo sicuro. Invia una breve nota con l'immagine, per esempio 'scontrino caffe pagato in contanti', oppure scrivi la spesa normalmente.",
@@ -38,6 +38,7 @@
     "command_lines": [
       "/help - esempi in linguaggio naturale",
       "/commands - lista comandi",
+      "/train - insegna conti predefiniti e alias tipo carta/contanti",
       "/setup - profilo conti e budget; accetta status o reset",
       "/add - inserimento transazione guidato",
       "/balances - saldi dei conti",

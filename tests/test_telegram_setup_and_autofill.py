@@ -35,12 +35,14 @@ class TelegramSetupAndAutofillTest(unittest.TestCase):
         service = _FakeService()
         state: dict[str, Any] = {}
         first = bot.start_finance_setup(service, state, source_text="it")
-        self.assertIn("Setup", first.text)
+        self.assertIn("Training", first.text)
 
         bot.handle_finance_setup_message(service, state, "1")
         bot.handle_finance_setup_message(service, state, "3")
         bot.handle_finance_setup_message(service, state, "4")
         bot.handle_finance_setup_message(service, state, "1")
+        bot.handle_finance_setup_message(service, state, "1")
+        bot.handle_finance_setup_message(service, state, "2")
         bot.handle_finance_setup_message(service, state, "yes")
         done = bot.handle_finance_setup_message(service, state, "yes")
 
@@ -51,6 +53,8 @@ class TelegramSetupAndAutofillTest(unittest.TestCase):
         self.assertEqual(profile["expense_destination_account"], "Misc Expenses")
         self.assertEqual(profile["income_source_account"], "Employer")
         self.assertEqual(profile["income_destination_account"], "Main Checking")
+        self.assertEqual(profile["payment_method_accounts"]["card"], "Main Checking")
+        self.assertEqual(profile["payment_method_accounts"]["cash"], "Cash")
 
     def test_apply_profile_and_history_autofill_uses_profile_defaults(self) -> None:
         service = _FakeService()
@@ -73,6 +77,20 @@ class TelegramSetupAndAutofillTest(unittest.TestCase):
         )
         self.assertEqual(updated["source"], "Main Checking")
         self.assertEqual(updated["destination"], "Misc Expenses")
+
+    def test_payment_alias_and_description_cleanup(self) -> None:
+        service = _FakeService()
+        state = {
+            "finance_profile": {
+                "setup_complete": True,
+                "payment_method_accounts": {"card": "Main Checking"},
+            }
+        }
+        self.assertEqual(
+            bot.infer_account_from_payment_method(service, "Caffe pagato con carta oggi", locale="it", state=state),
+            "Main Checking",
+        )
+        self.assertEqual(bot.clean_transaction_description("Caffe pagato con carta oggi"), "Caffe")
 
     def test_apply_profile_and_history_autofill_uses_history_for_category(self) -> None:
         service = _FakeService()

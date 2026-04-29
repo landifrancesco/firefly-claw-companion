@@ -2,10 +2,9 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
+import json
 import os
 from pathlib import Path
-import secrets
 import stat
 import subprocess
 import sys
@@ -13,78 +12,33 @@ from typing import Iterable
 
 import requests
 from requests.exceptions import RequestException
+import yaml
 
 
 HOST_ROOT = Path(os.getenv("SETUP_HOST_ROOT", Path.cwd()))
 ENV_PATH = HOST_ROOT / ".env"
 SECRETS_DIR = HOST_ROOT / "secrets"
 WORKSPACE_CONFIG_DIR = HOST_ROOT / "workspace" / "config"
-OPENCLAW_HOME = Path(os.getenv("OPENCLAW_HOME", str(Path.home() / ".openclaw")))
-BASE_CONFIG_PATH = Path("/opt/firefly-openclaw/config/openclaw.base.json5")
-
-
-@dataclass(slots=True)
-class ProviderChoice:
-    key: str
-    label: str
-    default_model: str
-    env_updates: dict[str, str]
-    requires_secret_prompt: bool = False
-    secret_env_name: str | None = None
-    secret_prompt: str | None = None
-    requires_oauth_login: bool = False
-    oauth_provider: str | None = None
-
-
-PROVIDERS: list[ProviderChoice] = [
-    ProviderChoice(
-        key="codex",
-        label="Codex OAuth (OpenAI Codex)",
-        default_model="openai-codex/gpt-5.4",
-        env_updates={},
-        requires_oauth_login=True,
-        oauth_provider="openai-codex",
-    ),
-    ProviderChoice(
-        key="openai",
-        label="OpenAI API key",
-        default_model="openai/gpt-5.4",
-        env_updates={},
-        requires_secret_prompt=True,
-        secret_env_name="OPENAI_API_KEY",
-        secret_prompt="OpenAI API key",
-    ),
-    ProviderChoice(
-        key="anthropic",
-        label="Anthropic API key",
-        default_model="anthropic/claude-sonnet-4-6",
-        env_updates={},
-        requires_secret_prompt=True,
-        secret_env_name="ANTHROPIC_API_KEY",
-        secret_prompt="Anthropic API key",
-    ),
-    ProviderChoice(
-        key="openrouter",
-        label="OpenRouter API key",
-        default_model="openrouter/anthropic/claude-sonnet-4-5",
-        env_updates={},
-        requires_secret_prompt=True,
-        secret_env_name="OPENROUTER_API_KEY",
-        secret_prompt="OpenRouter API key",
-    ),
-]
-
+PICOCLAW_HOME = Path(os.getenv("PICOCLAW_HOME", str(Path.home())))
+PICOCLAW_CONFIG_DIR = PICOCLAW_HOME / ".picoclaw"
+PICOCLAW_WORKSPACE = Path(os.getenv("PICOCLAW_WORKSPACE", str(PICOCLAW_CONFIG_DIR / "workspace")))
 
 MANAGED_ENV_ORDER = [
     "TZ",
     "FIREFLY_DOCKER_NETWORK",
+    "FIREFLY_DOCKER_NETWORK_EXTERNAL",
     "FIREFLY_BASE_URL",
     "FIREFLY_API_BASE_PATH",
-    "OPENCLAW_PORT",
-    "OPENCLAW_BIND",
-    "OPENCLAW_DEFAULT_MODEL",
+    "PICOCLAW_PORT",
+    "PICOCLAW_GATEWAY_HOST",
+    "PICOCLAW_LOG_LEVEL",
+    "PICOCLAW_DEFAULT_MODEL_NAME",
+    "PICOCLAW_DEFAULT_MODEL",
     "FIREFLY_TIMEOUT_SECONDS",
+    "FIREFLY_REQUEST_RETRIES",
+    "FIREFLY_RETRY_BACKOFF_SECONDS",
     "FIREFLY_VERIFY_TLS",
+    "FIREFLY_FORCE_CONNECTION_CLOSE",
     "FIREFLY_DEFAULT_DRY_RUN",
     "FIREFLY_HIGH_VALUE_THRESHOLD",
     "FIREFLY_DEDUPE_WINDOW_DAYS",
@@ -98,20 +52,18 @@ MANAGED_ENV_ORDER = [
     "TELEGRAM_ENABLED",
     "TELEGRAM_OWNER_ID",
     "TELEGRAM_TARGET_ID",
-    "TELEGRAM_DM_POLICY",
+    "PICOCLAW_TELEGRAM_CHANNEL_ENABLED",
     "FIREFLY_CHAT_LANGUAGE",
     "FIREFLY_RECEIPT_AI_OCR",
     "FIREFLY_PDF_OCR_PROVIDER_ENABLED",
     "PDFAPIHUB_API_KEY",
     "PDFAPIHUB_BASE_URL",
     "FIREFLY_PDF_OCR_LANG",
-    "OPENCLAW_TELEGRAM_CHANNEL_ENABLED",
     "OPENAI_API_KEY",
-    "OPENAI_API_KEYS",
     "ANTHROPIC_API_KEY",
     "OPENROUTER_API_KEY",
+    "GROQ_API_KEY",
     "GOOGLE_API_KEY",
-    "AI_GATEWAY_API_KEY",
     "EXAMPLE_FIREFLY_APP_URL",
     "EXAMPLE_FIREFLY_DB_NAME",
     "EXAMPLE_FIREFLY_DB_USER",
@@ -122,33 +74,20 @@ MANAGED_ENV_ORDER = [
 
 def print_banner() -> None:
     print(
-        r"""
+        """
 +--------------------------------------------------------------+
-|                  FIREFLY OPENCLAW COMPANION                  |
+|                  FIREFLY PICOCLAW COMPANION                  |
 |                      FIRST-RUN SETUP                         |
-+--------------------------------------------------------------+
-| This wizard writes host-side config and secrets for:         |
-|   - Firefly III REST bridge                                  |
-|   - OpenClaw model/provider setup                            |
-|   - Telegram control channel                                 |
 +--------------------------------------------------------------+
 """
     )
 
 
 def print_section(title: str) -> None:
-    line = "+" + "-" * 62 + "+"
     print("")
-    print(line)
+    print("+" + "-" * 62 + "+")
     print(f"| {title[:58].ljust(58)} |")
-    print(line)
-
-
-def print_hint(lines: list[str]) -> None:
-    print("")
-    print("  Hints:")
-    for line in lines:
-        print(f"    - {line}")
+    print("+" + "-" * 62 + "+")
 
 
 def parse_env_file(path: Path) -> dict[str, str]:
@@ -176,8 +115,8 @@ def prompt_text(
 
     suffix = f" [{default}]" if default not in (None, "") else ""
     while True:
-        prompt_value = f"{message}{suffix}: "
-        value = getpass.getpass(prompt_value) if secret_input and not plain_secrets else input(prompt_value)
+        prompt = f"{message}{suffix}: "
+        value = getpass.getpass(prompt) if secret_input and not plain_secrets else input(prompt)
         value = value.strip()
         if not value and default is not None:
             return default
@@ -194,9 +133,8 @@ def prompt_choice(message: str, options: Iterable[tuple[str, str]], *, default: 
         print(f"  {key}. {label}{marker}")
     while True:
         value = input(f"Choice [{default}]: ").strip() or default
-        for key, _label in rendered:
-            if value == key:
-                return value
+        if any(value == key for key, _label in rendered):
+            return value
         print("Choose one of the listed options.", file=sys.stderr)
 
 
@@ -213,12 +151,8 @@ def prompt_bool(message: str, *, default: bool) -> bool:
         print("Please answer yes or no.", file=sys.stderr)
 
 
-def ensure_parent(path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-
-
 def write_secret(path: Path, value: str) -> None:
-    ensure_parent(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(value.strip() + ("\n" if value.strip() else ""), encoding="utf-8")
     try:
         path.chmod(stat.S_IRUSR | stat.S_IWUSR)
@@ -227,29 +161,20 @@ def write_secret(path: Path, value: str) -> None:
 
 
 def write_env_file(path: Path, values: dict[str, str]) -> None:
-    ensure_parent(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
     lines = ["# Generated by scripts/setup_wizard.py", ""]
     for key in MANAGED_ENV_ORDER:
         lines.append(f"{key}={values.get(key, '')}")
     remaining = sorted(set(values).difference(MANAGED_ENV_ORDER))
     if remaining:
         lines.extend(["", "# Unmanaged existing values"])
-        for key in remaining:
-            lines.append(f"{key}={values[key]}")
+        lines.extend(f"{key}={values[key]}" for key in remaining)
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def ensure_openclaw_config_scaffold() -> None:
-    OPENCLAW_HOME.mkdir(parents=True, exist_ok=True)
-    base_target = OPENCLAW_HOME / "openclaw.base.json5"
-    include_target = OPENCLAW_HOME / "openclaw.json"
-    if BASE_CONFIG_PATH.exists() and not base_target.exists():
-        base_target.write_text(BASE_CONFIG_PATH.read_text(encoding="utf-8"), encoding="utf-8")
-    if not include_target.exists():
-        include_target.write_text(
-            "{\n  $include: [\"./openclaw.base.json5\", \"./openclaw.runtime.json5\"],\n}\n",
-            encoding="utf-8",
-        )
+def normalize_chat_id(value: str) -> str:
+    value = value.strip()
+    return value[3:] if value.startswith("tg:") else value
 
 
 def verify_firefly(base_url: str, api_path: str, token: str, timeout_seconds: float, verify_tls: bool) -> None:
@@ -261,280 +186,321 @@ def verify_firefly(base_url: str, api_path: str, token: str, timeout_seconds: fl
         verify=verify_tls,
     )
     response.raise_for_status()
-    payload = response.json()
-    version = payload.get("data", {}).get("version") or payload.get("version") or "unknown"
-    print(f"Firefly III API check succeeded against {url} (version: {version}).")
 
 
-def verify_telegram(bot_token: str, target_id: str) -> None:
-    test_message = (
-        "firefly-openclaw-companion setup test: Telegram is configured.\n"
-        "You should receive this message now.\n"
-        "If you do not receive it, your Telegram bot token or chat ID is wrong."
+def verify_telegram(bot_token: str, chat_id: str) -> None:
+    response = requests.post(
+        f"https://api.telegram.org/bot{bot_token}/sendMessage",
+        data={"chat_id": chat_id, "text": "firefly-picoclaw setup test"},
+        timeout=20,
     )
-    base = f"https://api.telegram.org/bot{bot_token}"
-    me_response = requests.get(f"{base}/getMe", timeout=15)
-    me_response.raise_for_status()
-    me_payload = me_response.json()
-    if not me_payload.get("ok"):
-        raise RuntimeError(f"Telegram getMe failed: {me_payload}")
+    response.raise_for_status()
+    payload = response.json()
+    if not payload.get("ok"):
+        raise RuntimeError(f"Telegram returned: {payload}")
 
-    send_response = requests.post(
-        f"{base}/sendMessage",
-        data={"chat_id": target_id, "text": test_message},
-        timeout=15,
+
+def seed_workspace_config() -> None:
+    WORKSPACE_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    mappings_example = WORKSPACE_CONFIG_DIR / "mappings.yml.example"
+    mappings = WORKSPACE_CONFIG_DIR / "mappings.yml"
+    policy_example = WORKSPACE_CONFIG_DIR / "policy.yml.example"
+    policy = WORKSPACE_CONFIG_DIR / "policy.yml"
+    if mappings_example.exists() and not mappings.exists():
+        mappings.write_text(mappings_example.read_text(encoding="utf-8"), encoding="utf-8")
+    if policy_example.exists() and not policy.exists():
+        policy.write_text(policy_example.read_text(encoding="utf-8"), encoding="utf-8")
+
+
+def seed_picoclaw_config(env_values: dict[str, str], telegram_token: str, firefly_token: str) -> None:
+    config_dir = PICOCLAW_CONFIG_DIR
+    workspace = PICOCLAW_WORKSPACE
+    security_dir = config_dir / ".security"
+    security_dir.mkdir(parents=True, exist_ok=True)
+    workspace.mkdir(parents=True, exist_ok=True)
+
+    model_name = env_values["PICOCLAW_DEFAULT_MODEL_NAME"]
+    api_key_refs = {
+        "gemini": "ref:google_api_key",
+        "google": "ref:google_api_key",
+        "groq": "ref:groq_api_key",
+        "openai": "ref:openai_api_key",
+        "anthropic": "ref:anthropic_api_key",
+        "openrouter": "ref:openrouter_api_key",
+    }
+    model_config = {
+        "model_name": model_name,
+        "model": env_values["PICOCLAW_DEFAULT_MODEL"],
+        "auth_method": "oauth" if model_name == "codex" else "api_key",
+    }
+    if model_name in api_key_refs:
+        model_config["api_key"] = api_key_refs[model_name]
+
+    config = {
+        "agents": {
+            "defaults": {
+                "workspace": str(workspace),
+                "restrict_to_workspace": True,
+                "model_name": env_values["PICOCLAW_DEFAULT_MODEL_NAME"],
+                "max_tokens": 8192,
+                "context_window": 131072,
+                "temperature": 0.7,
+                "max_tool_iterations": 20,
+            }
+        },
+        "model_list": [model_config],
+        "channels": {
+            "telegram": {
+                "enabled": env_values.get("PICOCLAW_TELEGRAM_CHANNEL_ENABLED", "false") == "true",
+                "token": "ref:telegram_bot_token",
+                "allow_from": [env_values["TELEGRAM_OWNER_ID"]],
+                "use_markdown_v2": False,
+                "streaming": {"enabled": True},
+            }
+        },
+        "tools": {
+            "exec": {"enabled": False},
+            "cron": {"enabled": False},
+            "web": {"enabled": False},
+            "i2c": {"enabled": False},
+            "serial": {"enabled": False},
+            "send_tts": {"enabled": False},
+            "skills": {"enabled": False},
+            "find_skills": {"enabled": False},
+            "install_skill": {"enabled": False},
+            "spawn": {"enabled": True},
+            "subagent": {"enabled": True},
+            "message": {"enabled": True},
+            "list_dir": {"enabled": True},
+            "read_file": {"enabled": True, "mode": "bytes"},
+            "write_file": {"enabled": True},
+            "edit_file": {"enabled": True},
+            "append_file": {"enabled": True},
+            "web_fetch": {"enabled": False},
+            "media_cleanup": {"enabled": True, "max_age_minutes": 30, "interval_minutes": 5},
+            "mcp": {
+                "enabled": True,
+                "servers": {
+                    "firefly-bridge": {
+                        "enabled": True,
+                        "command": "/opt/firefly-picoclaw/bin/firefly-bridge",
+                        "env": {
+                            "FIREFLY_BASE_URL": env_values["FIREFLY_BASE_URL"],
+                            "FIREFLY_API_BASE_PATH": env_values["FIREFLY_API_BASE_PATH"],
+                            "FIREFLY_TIMEOUT_SECONDS": env_values["FIREFLY_TIMEOUT_SECONDS"],
+                            "FIREFLY_VERIFY_TLS": env_values["FIREFLY_VERIFY_TLS"],
+                            "FIREFLY_DEFAULT_DRY_RUN": env_values["FIREFLY_DEFAULT_DRY_RUN"],
+                            "FIREFLY_HIGH_VALUE_THRESHOLD": env_values["FIREFLY_HIGH_VALUE_THRESHOLD"],
+                            "FIREFLY_DEDUPE_WINDOW_DAYS": env_values["FIREFLY_DEDUPE_WINDOW_DAYS"],
+                            "FIREFLY_ALLOW_DELETE": env_values["FIREFLY_ALLOW_DELETE"],
+                            "FIREFLY_MAPPINGS_PATH": env_values["FIREFLY_MAPPINGS_PATH"],
+                            "FIREFLY_POLICY_PATH": env_values["FIREFLY_POLICY_PATH"],
+                            "FIREFLY_ACCESS_TOKEN_FILE": str(security_dir / "firefly_access_token"),
+                        },
+                    }
+                },
+            },
+        },
+        "hooks": {"enabled": True},
+        "heartbeat": {"enabled": True, "interval": 30},
+        "gateway": {
+            "host": env_values["PICOCLAW_GATEWAY_HOST"],
+            "port": int(env_values["PICOCLAW_PORT"]),
+            "log_level": env_values["PICOCLAW_LOG_LEVEL"],
+        },
+    }
+
+    (config_dir / "config.json").write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
+    try:
+        (config_dir / "config.json").chmod(stat.S_IRUSR | stat.S_IWUSR)
+    except OSError:
+        pass
+    security_yml = config_dir / ".security.yml"
+    security_yml.write_text(
+        yaml.safe_dump(
+            {
+                "telegram_bot_token": telegram_token,
+                "openai_api_key": env_values.get("OPENAI_API_KEY", ""),
+                "anthropic_api_key": env_values.get("ANTHROPIC_API_KEY", ""),
+                "openrouter_api_key": env_values.get("OPENROUTER_API_KEY", ""),
+                "groq_api_key": env_values.get("GROQ_API_KEY", ""),
+                "google_api_key": env_values.get("GOOGLE_API_KEY", ""),
+                "pdfapihub_api_key": env_values.get("PDFAPIHUB_API_KEY", ""),
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
     )
     try:
-        send_payload = send_response.json()
-    except ValueError:
-        send_payload = {"ok": False, "description": send_response.text}
-    if send_response.status_code >= 400 or not send_payload.get("ok"):
-        raise RuntimeError(f"Telegram sendMessage failed: {send_payload}")
-
-    bot_username = me_payload.get("result", {}).get("username", "<unknown>")
-    print(f"Telegram bot validation succeeded for @{bot_username}.")
-    print("You should receive the Telegram setup test message now. If not, stop here and fix the bot token or chat ID.")
-
-
-def print_firefly_check_failure(base_url: str, api_path: str, exc: Exception) -> None:
-    print("")
-    print("+--------------------------------------------------------------+")
-    print("| Firefly Check Failed                                         |")
-    print("+--------------------------------------------------------------+")
-    print(f"  URL: {base_url.rstrip('/')}{api_path}")
-    print(f"  Error: {exc}")
-    print("")
-    print("  Common causes:")
-    print("    - the hostname cannot be resolved from inside Docker")
-    print("    - the remote VPS is not reachable from this machine")
-    print("    - the HTTPS certificate is self-signed and TLS verification is enabled")
-    print("    - the API base URL or path is wrong")
-    print("")
-    print("  What to do next:")
-    print("    - if this Firefly host is remote, verify the domain resolves from inside Docker")
-    print("    - try the Firefly server IP temporarily instead of the hostname")
-    print("    - rerun setup with --skip-firefly-check if you only want to save config first")
-    print("    - later test with: docker-compose exec companion python3 -m firefly_companion.cli health")
-    print("")
-
-
-def normalize_chat_id(value: str) -> str:
-    value = value.strip()
-    if value.startswith("tg:"):
-        return value[3:]
-    return value
+        security_yml.chmod(stat.S_IRUSR | stat.S_IWUSR)
+    except OSError:
+        pass
+    write_secret(security_dir / "firefly_access_token", firefly_token)
 
 
 def run_codex_login() -> None:
-    ensure_openclaw_config_scaffold()
-    print("Starting Codex OAuth login inside the setup container.")
-    print("If the environment is headless, OpenClaw may print a URL and ask you to paste the redirect result.")
-    subprocess.run(["openclaw", "models", "auth", "login", "--provider", "openai-codex"], check=True)
+    print("Starting PicoClaw Codex OAuth login.")
+    subprocess.run(["picoclaw", "auth", "login"], check=True)
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Interactive first-run setup for firefly-openclaw-companion.")
+    parser = argparse.ArgumentParser(description="Interactive first-run setup for firefly-picoclaw-companion.")
     parser.add_argument("--skip-firefly-check", action="store_true", help="Skip the Firefly III API validation step.")
     parser.add_argument("--skip-telegram-test", action="store_true", help="Skip the Telegram sendMessage test.")
     parser.add_argument("--skip-codex-login", action="store_true", help="Do not launch the Codex OAuth login flow.")
-    parser.add_argument(
-        "--plain-secrets",
-        action="store_true",
-        help="Use normal visible input instead of hidden getpass prompts for secrets. Useful if paste is unreliable.",
-    )
+    parser.add_argument("--plain-secrets", action="store_true", help="Use visible input instead of hidden secret prompts.")
     args = parser.parse_args(argv)
 
     existing = parse_env_file(ENV_PATH)
     print_banner()
     print(f"Host repository root: {HOST_ROOT}")
 
-    print_section("OpenClaw Provider")
-    provider_index = prompt_choice(
-        "Choose the OpenClaw model/provider setup:",
-        [(str(index + 1), provider.label) for index, provider in enumerate(PROVIDERS)],
-        default="1",
-    )
-    provider = PROVIDERS[int(provider_index) - 1]
-    provider_values = dict(provider.env_updates)
-    if provider.requires_secret_prompt and provider.secret_env_name and provider.secret_prompt:
-        provider_values[provider.secret_env_name] = prompt_text(
-            provider.secret_prompt,
-            secret_input=True,
-            plain_secrets=args.plain_secrets,
-        )
-
     print_section("Firefly III")
-    print_hint(
-        [
-            "If Firefly III runs beside the companion on the same Docker host, use the internal URL, usually http://firefly:8080.",
-            "If Firefly III runs on another VPS, use its reachable URL, for example https://firefly.example.com.",
-            "The API base path is usually /api/v1.",
-            "The Docker network name is only meaningful for local same-host deployments; leave the default if Firefly is remote.",
-            "Create the personal access token in Firefly III from the profile area.",
-            "If you know the token expiry date, enter it later so Telegram reminders can warn you before it expires.",
-        ]
-    )
     timezone_value = prompt_text("Timezone", default=existing.get("TZ", "Europe/Rome"))
     network_name = prompt_text("Docker network where Firefly III is reachable", default=existing.get("FIREFLY_DOCKER_NETWORK", "firefly"))
-    firefly_base_url = prompt_text(
-        "Firefly III base URL (examples: http://firefly:8080 or https://firefly.example.com)",
-        default=existing.get("FIREFLY_BASE_URL", "http://firefly:8080"),
-    )
+    firefly_base_url = prompt_text("Firefly III base URL", default=existing.get("FIREFLY_BASE_URL", "http://firefly:8080"))
     firefly_api_path = prompt_text("Firefly III API base path", default=existing.get("FIREFLY_API_BASE_PATH", "/api/v1"))
-    firefly_token = prompt_text(
-        "Firefly III personal access token",
-        secret_input=True,
-        plain_secrets=args.plain_secrets,
-    )
+    firefly_token = prompt_text("Firefly III personal access token", secret_input=True, plain_secrets=args.plain_secrets)
     firefly_token_expires_on = prompt_text(
-        "Firefly III token expiry date in YYYY-MM-DD (leave blank if unknown)",
+        "Firefly III token expiry date in YYYY-MM-DD (blank if unknown)",
         default=existing.get("FIREFLY_ACCESS_TOKEN_EXPIRES_ON", ""),
         allow_blank=True,
     )
     timeout_value = prompt_text("Firefly request timeout in seconds", default=existing.get("FIREFLY_TIMEOUT_SECONDS", "15"))
     verify_tls = prompt_bool("Verify Firefly TLS certificates", default=existing.get("FIREFLY_VERIFY_TLS", "true").lower() != "false")
+    dry_run_default = prompt_bool("Default bridge writes to dry-run mode", default=existing.get("FIREFLY_DEFAULT_DRY_RUN", "true").lower() != "false")
+    high_value_threshold = prompt_text("High-value confirmation threshold", default=existing.get("FIREFLY_HIGH_VALUE_THRESHOLD", "250.00"))
+    allow_delete = prompt_bool("Allow delete operations through the bridge", default=existing.get("FIREFLY_ALLOW_DELETE", "false").lower() == "true")
 
     print_section("Telegram")
-    print_hint(
-        [
-            "Create a bot with @BotFather and copy the bot token here.",
-            "Start a chat with your bot before testing.",
-            "For the common case, use your personal numeric Telegram user ID as the owner ID.",
-            "You can get it from helper bots such as @username_to_id_bot.",
-            "You can also DM your bot, then open:",
-            "https://api.telegram.org/bot<YOUR_BOT_TOKEN>/getUpdates",
-            "For private chats, message.chat.id and from.id are usually the same positive integer.",
-            "For groups, message.chat.id is the group chat ID, but from.id is still your personal user ID.",
-            "OpenClaw DM authorization needs your personal user ID, not a group ID.",
-            "Leave the delivery target blank unless you want startup/reminder messages to go somewhere else.",
-            "The wizard will send a test message. If you do not receive it, the Telegram configuration is wrong.",
-        ]
-    )
-    telegram_enabled = True
-    telegram_bot_token = prompt_text(
-        "Telegram bot token",
-        secret_input=True,
-        plain_secrets=args.plain_secrets,
-    )
-    telegram_owner_id = normalize_chat_id(
-        prompt_text(
-            "Telegram owner/user ID allowed to control the bot",
-            default=existing.get("TELEGRAM_OWNER_ID", existing.get("TELEGRAM_TARGET_ID", "")),
+    telegram_enabled = prompt_bool("Enable Telegram command bot", default=existing.get("TELEGRAM_ENABLED", "true").lower() != "false")
+    telegram_bot_token = ""
+    telegram_owner_id = ""
+    telegram_target_id = ""
+    if telegram_enabled:
+        telegram_bot_token = prompt_text("Telegram bot token", secret_input=True, plain_secrets=args.plain_secrets)
+        telegram_owner_id = normalize_chat_id(
+            prompt_text("Telegram owner/user ID allowed to control the bot", default=existing.get("TELEGRAM_OWNER_ID", ""))
         )
-    )
-    telegram_target_id = normalize_chat_id(
-        prompt_text(
-            "Optional Telegram delivery chat ID for startup/reminder messages (blank = use owner ID)",
-            default=existing.get("TELEGRAM_TARGET_ID", telegram_owner_id),
-            allow_blank=True,
-        )
-    )
-    if not telegram_target_id:
-        telegram_target_id = telegram_owner_id
-    telegram_dm_policy = prompt_choice(
-        "Telegram DM policy:",
-        [("allowlist", "Only the configured Telegram ID can use the bot"), ("pairing", "Require pairing before use")],
-        default="allowlist" if existing.get("TELEGRAM_DM_POLICY") not in {"allowlist", "pairing"} else existing["TELEGRAM_DM_POLICY"],
-    )
+        telegram_target_id = normalize_chat_id(
+            prompt_text(
+                "Optional Telegram delivery chat ID for reminders (blank = owner ID)",
+                default=existing.get("TELEGRAM_TARGET_ID", telegram_owner_id),
+                allow_blank=True,
+            )
+        ) or telegram_owner_id
     chat_language = prompt_choice(
-        "Preferred Telegram chat language:",
-        [("auto", "Auto-detect from each message"), ("en", "English"), ("it", "Italiano")],
+        "Preferred chat language:",
+        [("auto", "Auto-detect"), ("en", "English"), ("it", "Italiano")],
         default=existing.get("FIREFLY_CHAT_LANGUAGE", "auto") if existing.get("FIREFLY_CHAT_LANGUAGE") in {"auto", "en", "it"} else "auto",
     )
 
-    print_section("Companion Defaults")
-    print_hint(
+    print_section("AI Provider")
+    provider_choice = prompt_choice(
+        "Choose AI provider:",
         [
-            "The gateway token protects the internal OpenClaw gateway.",
-            "Dry-run should normally stay enabled by default.",
-            "Use a conservative high-value threshold so writes require explicit confirmation.",
-        ]
+            ("gemini", "Google AI Studio Gemini 2.5 Flash (free tier)"),
+            ("groq", "Groq openai/gpt-oss-20b"),
+            ("openai", "OpenAI API"),
+            ("anthropic", "Anthropic Claude API"),
+            ("openrouter", "OpenRouter (multi-model)"),
+            ("codex", "OpenAI Codex (requires OAuth)"),
+        ],
+        default=existing.get("PICOCLAW_DEFAULT_MODEL_NAME", "gemini"),
     )
-    default_model = prompt_text("Default OpenClaw model", default=existing.get("OPENCLAW_DEFAULT_MODEL", provider.default_model))
-    gateway_token = prompt_text(
-        "OpenClaw gateway token",
-        default=existing.get("OPENCLAW_GATEWAY_TOKEN", secrets.token_urlsafe(24)),
-        secret_input=True,
-        plain_secrets=args.plain_secrets,
-    )
-    dry_run_default = prompt_bool("Default bridge writes to dry-run mode", default=existing.get("FIREFLY_DEFAULT_DRY_RUN", "true").lower() != "false")
-    high_value_threshold = prompt_text("High-value confirmation threshold", default=existing.get("FIREFLY_HIGH_VALUE_THRESHOLD", "250.00"))
+
+    provider_models = {
+        "gemini": ("gemini", "gemini/gemini-2.5-flash"),
+        "groq": ("groq", "groq/openai/gpt-oss-20b"),
+        "openai": ("openai", "openai/gpt-4o-mini"),
+        "anthropic": ("anthropic", "anthropic/claude-sonnet-4-6"),
+        "openrouter": ("openrouter", "openrouter/anthropic/claude-sonnet-4-5"),
+        "codex": ("codex", "openai-codex/gpt-5.4"),
+    }
+    model_name, default_model = provider_models.get(provider_choice, ("gemini", "gemini/gemini-2.5-flash"))
+
+    api_key = ""
+    if provider_choice == "gemini":
+        api_key = prompt_text("Google AI Studio API key", secret_input=True, plain_secrets=args.plain_secrets)
+    elif provider_choice == "groq":
+        api_key = prompt_text("Groq API key", secret_input=True, plain_secrets=args.plain_secrets)
+    elif provider_choice == "openai":
+        api_key = prompt_text("OpenAI API key", secret_input=True, plain_secrets=args.plain_secrets)
+    elif provider_choice == "anthropic":
+        api_key = prompt_text("Anthropic API key", secret_input=True, plain_secrets=args.plain_secrets)
+    elif provider_choice == "openrouter":
+        api_key = prompt_text("OpenRouter API key", secret_input=True, plain_secrets=args.plain_secrets)
+
+    print_section("OCR and Model")
+    pdf_enabled = prompt_bool("Enable PDFAPIHUB OCR support", default=existing.get("FIREFLY_PDF_OCR_PROVIDER_ENABLED", "true").lower() != "false")
+    pdf_key = ""
+    if pdf_enabled:
+        pdf_key = prompt_text(
+            "PDFAPIHUB API key (blank if not configured yet)",
+            default=existing.get("PDFAPIHUB_API_KEY", ""),
+            secret_input=True,
+            allow_blank=True,
+            plain_secrets=args.plain_secrets,
+        )
     verify_on_boot = prompt_bool("Verify Firefly health during container bootstrap", default=existing.get("FIREFLY_RUNTIME_VERIFY_ON_BOOT", "true").lower() != "false")
 
     if not args.skip_firefly_check:
         try:
-            verify_firefly(
-                base_url=firefly_base_url,
-                api_path=firefly_api_path,
-                token=firefly_token,
-                timeout_seconds=float(timeout_value),
-                verify_tls=verify_tls,
-            )
+            verify_firefly(firefly_base_url, firefly_api_path, firefly_token, float(timeout_value), verify_tls)
         except RequestException as exc:
-            print_firefly_check_failure(firefly_base_url, firefly_api_path, exc)
+            print(f"Firefly validation failed: {exc}", file=sys.stderr)
             return 2
 
-    if not args.skip_telegram_test:
+    if telegram_enabled and not args.skip_telegram_test:
         try:
             verify_telegram(telegram_bot_token, telegram_target_id)
         except Exception as exc:
-            print("")
-            print("Telegram validation failed.")
-            print(f"Error: {exc}")
-            print("")
-            print("Most common causes:")
-            print("  - the chat ID is wrong")
-            print("  - you have not started the bot yet in that private chat")
-            print("  - for groups, the bot is not added to the group")
-            print("  - you copied a username instead of the numeric chat ID")
-            print("If you did not receive the test message, fix the bot token or chat ID before continuing.")
+            print(f"Telegram validation failed: {exc}", file=sys.stderr)
             return 3
-
-    if provider.requires_oauth_login and not args.skip_codex_login:
-        run_codex_login()
 
     env_values = parse_env_file(ENV_PATH)
     env_values.update(
         {
             "TZ": timezone_value,
             "FIREFLY_DOCKER_NETWORK": network_name,
+            "FIREFLY_DOCKER_NETWORK_EXTERNAL": env_values.get("FIREFLY_DOCKER_NETWORK_EXTERNAL", "false"),
             "FIREFLY_BASE_URL": firefly_base_url,
             "FIREFLY_API_BASE_PATH": firefly_api_path,
-            "OPENCLAW_PORT": "18789",
-            "OPENCLAW_BIND": env_values.get("OPENCLAW_BIND", "loopback"),
-            "OPENCLAW_DEFAULT_MODEL": default_model,
+            "PICOCLAW_PORT": "18790",
+            "PICOCLAW_GATEWAY_HOST": "127.0.0.1",
+            "PICOCLAW_LOG_LEVEL": env_values.get("PICOCLAW_LOG_LEVEL", "info"),
+            "PICOCLAW_DEFAULT_MODEL_NAME": model_name,
+            "PICOCLAW_DEFAULT_MODEL": default_model,
             "FIREFLY_TIMEOUT_SECONDS": timeout_value,
+            "FIREFLY_REQUEST_RETRIES": env_values.get("FIREFLY_REQUEST_RETRIES", "2"),
+            "FIREFLY_RETRY_BACKOFF_SECONDS": env_values.get("FIREFLY_RETRY_BACKOFF_SECONDS", "0.5"),
             "FIREFLY_VERIFY_TLS": "true" if verify_tls else "false",
+            "FIREFLY_FORCE_CONNECTION_CLOSE": env_values.get("FIREFLY_FORCE_CONNECTION_CLOSE", "true"),
             "FIREFLY_DEFAULT_DRY_RUN": "true" if dry_run_default else "false",
             "FIREFLY_HIGH_VALUE_THRESHOLD": high_value_threshold,
             "FIREFLY_DEDUPE_WINDOW_DAYS": env_values.get("FIREFLY_DEDUPE_WINDOW_DAYS", "7"),
-            "FIREFLY_ALLOW_DELETE": "false",
+            "FIREFLY_ALLOW_DELETE": "true" if allow_delete else "false",
             "FIREFLY_RUNTIME_VERIFY_ON_BOOT": "true" if verify_on_boot else "false",
             "FIREFLY_ACCESS_TOKEN_EXPIRES_ON": firefly_token_expires_on,
             "FIREFLY_TOKEN_REMINDER_DAYS": env_values.get("FIREFLY_TOKEN_REMINDER_DAYS", "60,30,14,7,3,1"),
-            "FIREFLY_TOKEN_REMINDER_CHECK_INTERVAL_SECONDS": env_values.get(
-                "FIREFLY_TOKEN_REMINDER_CHECK_INTERVAL_SECONDS",
-                "21600",
-            ),
-            "FIREFLY_MAPPINGS_PATH": "/home/openclaw/workspace/config/mappings.yml",
-            "FIREFLY_POLICY_PATH": "/home/openclaw/workspace/config/policy.yml",
-            "TELEGRAM_ENABLED": "true",
+            "FIREFLY_TOKEN_REMINDER_CHECK_INTERVAL_SECONDS": env_values.get("FIREFLY_TOKEN_REMINDER_CHECK_INTERVAL_SECONDS", "21600"),
+            "FIREFLY_MAPPINGS_PATH": "/home/picoclaw/.picoclaw/workspace/config/mappings.yml",
+            "FIREFLY_POLICY_PATH": "/home/picoclaw/.picoclaw/workspace/config/policy.yml",
+            "TELEGRAM_ENABLED": "true" if telegram_enabled else "false",
             "TELEGRAM_OWNER_ID": telegram_owner_id,
             "TELEGRAM_TARGET_ID": telegram_target_id,
-            "TELEGRAM_DM_POLICY": telegram_dm_policy,
+            "PICOCLAW_TELEGRAM_CHANNEL_ENABLED": "false",
             "FIREFLY_CHAT_LANGUAGE": chat_language,
             "FIREFLY_RECEIPT_AI_OCR": env_values.get("FIREFLY_RECEIPT_AI_OCR", "true"),
-            "FIREFLY_PDF_OCR_PROVIDER_ENABLED": env_values.get("FIREFLY_PDF_OCR_PROVIDER_ENABLED", "true"),
-            "PDFAPIHUB_API_KEY": env_values.get("PDFAPIHUB_API_KEY", ""),
+            "FIREFLY_PDF_OCR_PROVIDER_ENABLED": "true" if pdf_enabled else "false",
+            "PDFAPIHUB_API_KEY": pdf_key,
             "PDFAPIHUB_BASE_URL": env_values.get("PDFAPIHUB_BASE_URL", "https://pdfapihub.com/api"),
             "FIREFLY_PDF_OCR_LANG": env_values.get("FIREFLY_PDF_OCR_LANG", "ita+eng"),
-            "OPENCLAW_TELEGRAM_CHANNEL_ENABLED": "false",
-            "OPENAI_API_KEY": "",
-            "OPENAI_API_KEYS": env_values.get("OPENAI_API_KEYS", ""),
-            "ANTHROPIC_API_KEY": "",
-            "OPENROUTER_API_KEY": "",
-            "GOOGLE_API_KEY": env_values.get("GOOGLE_API_KEY", ""),
-            "AI_GATEWAY_API_KEY": env_values.get("AI_GATEWAY_API_KEY", ""),
+            "OPENAI_API_KEY": api_key if provider_choice == "openai" else env_values.get("OPENAI_API_KEY", ""),
+            "ANTHROPIC_API_KEY": api_key if provider_choice == "anthropic" else env_values.get("ANTHROPIC_API_KEY", ""),
+            "OPENROUTER_API_KEY": api_key if provider_choice == "openrouter" else env_values.get("OPENROUTER_API_KEY", ""),
+            "GROQ_API_KEY": api_key if provider_choice == "groq" else env_values.get("GROQ_API_KEY", ""),
+            "GOOGLE_API_KEY": api_key if provider_choice == "gemini" else env_values.get("GOOGLE_API_KEY", ""),
             "EXAMPLE_FIREFLY_APP_URL": env_values.get("EXAMPLE_FIREFLY_APP_URL", "http://localhost:8080"),
             "EXAMPLE_FIREFLY_DB_NAME": env_values.get("EXAMPLE_FIREFLY_DB_NAME", "firefly"),
             "EXAMPLE_FIREFLY_DB_USER": env_values.get("EXAMPLE_FIREFLY_DB_USER", "firefly"),
@@ -542,37 +508,42 @@ def main(argv: list[str] | None = None) -> int:
             "EXAMPLE_FIREFLY_SITE_OWNER": env_values.get("EXAMPLE_FIREFLY_SITE_OWNER", "owner@example.test"),
         }
     )
-    env_values.update(provider_values)
 
     SECRETS_DIR.mkdir(parents=True, exist_ok=True)
     write_secret(SECRETS_DIR / "firefly_access_token.txt", firefly_token)
-    write_secret(SECRETS_DIR / "openclaw_gateway_token.txt", gateway_token)
     write_secret(SECRETS_DIR / "telegram_bot_token.txt", telegram_bot_token)
+    if provider_choice == "gemini" and api_key:
+        write_secret(SECRETS_DIR / "google_api_key.txt", api_key)
+    elif provider_choice == "groq" and api_key:
+        write_secret(SECRETS_DIR / "groq_api_key.txt", api_key)
+    elif provider_choice == "openai" and api_key:
+        write_secret(SECRETS_DIR / "openai_api_key.txt", api_key)
+    elif provider_choice == "anthropic" and api_key:
+        write_secret(SECRETS_DIR / "anthropic_api_key.txt", api_key)
+    elif provider_choice == "openrouter" and api_key:
+        write_secret(SECRETS_DIR / "openrouter_api_key.txt", api_key)
+    if pdf_key:
+        write_secret(SECRETS_DIR / "pdfapihub_api_key.txt", pdf_key)
 
-    WORKSPACE_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    example_mappings = WORKSPACE_CONFIG_DIR / "mappings.yml.example"
-    example_policy = WORKSPACE_CONFIG_DIR / "policy.yml.example"
-    target_mappings = WORKSPACE_CONFIG_DIR / "mappings.yml"
-    target_policy = WORKSPACE_CONFIG_DIR / "policy.yml"
-    if example_mappings.exists() and not target_mappings.exists():
-        target_mappings.write_text(example_mappings.read_text(encoding="utf-8"), encoding="utf-8")
-    if example_policy.exists() and not target_policy.exists():
-        target_policy.write_text(example_policy.read_text(encoding="utf-8"), encoding="utf-8")
-
+    seed_workspace_config()
+    seed_picoclaw_config(env_values, telegram_bot_token, firefly_token)
     write_env_file(ENV_PATH, env_values)
+
+    if provider_choice == "codex" and not args.skip_codex_login:
+        try:
+            run_codex_login()
+        except (OSError, subprocess.CalledProcessError) as exc:
+            print(f"PicoClaw Codex OAuth login did not complete: {exc}", file=sys.stderr)
+            print("Run `docker compose run --rm setup picoclaw auth login` or use the PicoClaw auth flow later.", file=sys.stderr)
 
     print("")
     print_section("Setup Complete")
-    print("  Files written:")
-    print("    - .env")
-    print("    - secrets/firefly_access_token.txt")
-    print("    - secrets/openclaw_gateway_token.txt")
-    print("    - secrets/telegram_bot_token.txt")
+    print("  Secrets saved to secrets/ and PicoClaw security files.")
+    print("  Configuration saved to .env and the picoclaw_home volume.")
     print("")
-    print("  Next commands:")
+    print("  Next:")
     print("    1. docker compose up -d --build")
-    print("    2. Wait for the automatic Telegram startup message from the companion.")
-    print("    3. Send a Telegram message to your bot from the configured chat.")
+    print("    2. Send /help to the Telegram bot after PicoClaw starts.")
     return 0
 
 
