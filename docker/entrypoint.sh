@@ -87,7 +87,7 @@ if [[ -z "${FIREFLY_TOKEN}" ]]; then
   exit 12
 fi
 
-export PICOCLAW_CONFIG_DIR PICOCLAW_WORKSPACE RUNTIME_PORT RUNTIME_HOST
+export PICOCLAW_HOME PICOCLAW_CONFIG_DIR PICOCLAW_WORKSPACE RUNTIME_PORT RUNTIME_HOST
 export PICOCLAW_DEFAULT_MODEL_NAME="${PICOCLAW_DEFAULT_MODEL_NAME:-gemini}"
 export PICOCLAW_DEFAULT_MODEL="${PICOCLAW_DEFAULT_MODEL:-gemini/gemini-2.5-flash}"
 export PICOCLAW_LOG_LEVEL="${PICOCLAW_LOG_LEVEL:-info}"
@@ -291,6 +291,50 @@ cp "${PICOCLAW_CONFIG_DIR}/config.json" "${PICOCLAW_HOME}/config.json"
 cp "${PICOCLAW_CONFIG_DIR}/.security.yml" "${PICOCLAW_HOME}/.security.yml"
 chmod 0600 "${PICOCLAW_HOME}/config.json" "${PICOCLAW_HOME}/.security.yml"
 
+# Older companion builds accidentally allowed flat secret keys to survive in
+# config.json. Newer PicoClaw rejects those keys before migration, so clean both
+# config locations before every PicoClaw invocation.
+python3 <<'PY'
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+
+forbidden = {
+    "telegram_bot_token",
+    "openai_api_key",
+    "anthropic_api_key",
+    "openrouter_api_key",
+    "groq_api_key",
+    "google_api_key",
+    "pdfapihub_api_key",
+}
+
+paths = [
+    Path(os.getenv("PICOCLAW_CONFIG_DIR", "/home/picoclaw/.picoclaw")) / "config.json",
+    Path(os.getenv("PICOCLAW_HOME", "/home/picoclaw")) / "config.json",
+]
+
+for path in paths:
+    if not path.exists():
+        continue
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        continue
+    if not isinstance(payload, dict):
+        continue
+    changed = False
+    for key in forbidden:
+        if key in payload:
+            payload.pop(key, None)
+            changed = True
+    if changed:
+        path.write_text(json.dumps(payload, indent=2, sort_keys=False) + "\n", encoding="utf-8")
+        path.chmod(0o600)
+PY
+
 # Force schema migration before gateway startup, then replace migrated secret
 # placeholders with actual values. PicoClaw v3 stores secrets in a nested shape
 # matching config.json, not in the flat legacy file generated above.
@@ -304,7 +348,7 @@ from pathlib import Path
 
 import yaml
 
-home = Path(os.environ["PICOCLAW_HOME"])
+home = Path(os.getenv("PICOCLAW_HOME", "/home/picoclaw"))
 security_path = home / ".security.yml"
 security = yaml.safe_load(security_path.read_text(encoding="utf-8")) if security_path.exists() else {}
 if not isinstance(security, dict):
@@ -332,6 +376,47 @@ security_path.write_text(yaml.safe_dump(security, sort_keys=False), encoding="ut
 security_path.chmod(0o600)
 PY
 
+python3 <<'PY'
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+
+forbidden = {
+    "telegram_bot_token",
+    "openai_api_key",
+    "anthropic_api_key",
+    "openrouter_api_key",
+    "groq_api_key",
+    "google_api_key",
+    "pdfapihub_api_key",
+}
+
+paths = [
+    Path(os.getenv("PICOCLAW_CONFIG_DIR", "/home/picoclaw/.picoclaw")) / "config.json",
+    Path(os.getenv("PICOCLAW_HOME", "/home/picoclaw")) / "config.json",
+]
+
+for path in paths:
+    if not path.exists():
+        continue
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        continue
+    if not isinstance(payload, dict):
+        continue
+    changed = False
+    for key in forbidden:
+        if key in payload:
+            payload.pop(key, None)
+            changed = True
+    if changed:
+        path.write_text(json.dumps(payload, indent=2, sort_keys=False) + "\n", encoding="utf-8")
+        path.chmod(0o600)
+PY
+
 if [[ "${VERIFY_ON_BOOT}" == "true" ]]; then
   if ! python3 -m firefly_companion.cli health >/dev/null 2>&1; then
     echo "Warning: Firefly bridge health check failed during bootstrap." >&2
@@ -343,6 +428,42 @@ if [[ "$#" -eq 0 ]]; then
 fi
 
 if [[ "$1" == "picoclaw" && "${2:-}" == "gateway" ]]; then
+  python3 <<'PY'
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+
+forbidden = {
+    "telegram_bot_token",
+    "openai_api_key",
+    "anthropic_api_key",
+    "openrouter_api_key",
+    "groq_api_key",
+    "google_api_key",
+    "pdfapihub_api_key",
+}
+
+paths = [
+    Path(os.getenv("PICOCLAW_CONFIG_DIR", "/home/picoclaw/.picoclaw")) / "config.json",
+    Path(os.getenv("PICOCLAW_HOME", "/home/picoclaw")) / "config.json",
+]
+
+for path in paths:
+    if not path.exists():
+        continue
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        continue
+    if not isinstance(payload, dict):
+        continue
+    for key in forbidden:
+        payload.pop(key, None)
+    path.write_text(json.dumps(payload, indent=2, sort_keys=False) + "\n", encoding="utf-8")
+    path.chmod(0o600)
+PY
   python3 /opt/firefly-picoclaw/bin/token_expiry_reminder.py &
   if [[ "${TELEGRAM_ENABLED}" == "true" ]]; then
     python3 /opt/firefly-picoclaw/bin/telegram_firefly_bot.py &

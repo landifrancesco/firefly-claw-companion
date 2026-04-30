@@ -13,12 +13,15 @@ from scripts import telegram_firefly_bot as bot
 
 class _FakeClient:
     def list_accounts(self, kind: str = "all") -> list[dict[str, Any]]:
-        return [
+        accounts = [
             {"attributes": {"name": "Main Checking", "type": "asset"}},
             {"attributes": {"name": "Cash", "type": "asset"}},
             {"attributes": {"name": "Misc Expenses", "type": "expense"}},
             {"attributes": {"name": "Employer", "type": "revenue"}},
         ]
+        if kind and kind != "all":
+            return [item for item in accounts if item["attributes"]["type"] == kind]
+        return accounts
 
 
 class _FakeService:
@@ -36,10 +39,18 @@ class TelegramSetupAndAutofillTest(unittest.TestCase):
         state: dict[str, Any] = {}
         first = bot.start_finance_setup(service, state, source_text="it")
         self.assertIn("Training", first.text)
+        self.assertIn("Da quale conto paghi", first.text)
+        self.assertIn("Main Checking", first.text)
+        self.assertNotIn("Misc Expenses", first.text)
+
+        second = bot.handle_finance_setup_message(service, state, "1")
+        self.assertIsNotNone(second)
+        self.assertIn("expense account", second.text)
+        self.assertIn("Misc Expenses", second.text)
+        self.assertNotIn("Main Checking", second.text)
 
         bot.handle_finance_setup_message(service, state, "1")
-        bot.handle_finance_setup_message(service, state, "3")
-        bot.handle_finance_setup_message(service, state, "4")
+        bot.handle_finance_setup_message(service, state, "1")
         bot.handle_finance_setup_message(service, state, "1")
         bot.handle_finance_setup_message(service, state, "1")
         bot.handle_finance_setup_message(service, state, "2")
@@ -77,6 +88,17 @@ class TelegramSetupAndAutofillTest(unittest.TestCase):
         )
         self.assertEqual(updated["source"], "Main Checking")
         self.assertEqual(updated["destination"], "Misc Expenses")
+
+    def test_budget_report_shows_left_and_limit_only_budgets(self) -> None:
+        text = bot.format_budget_report(
+            [{"type": "withdrawal", "budget_name": "Groceries", "amount": "40.00"}],
+            label="2026-04",
+            budget_limits={"Groceries": 100.0, "Travel": 50.0},
+            source_text="en",
+        )
+
+        self.assertIn("Groceries: spent 40.00 / limit 100.00 (left: 60.00)", text)
+        self.assertIn("Travel: spent 0.00 / limit 50.00 (left: 50.00)", text)
 
     def test_payment_alias_and_description_cleanup(self) -> None:
         service = _FakeService()

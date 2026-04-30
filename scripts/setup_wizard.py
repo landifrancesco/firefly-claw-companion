@@ -357,8 +357,35 @@ def main(argv: list[str] | None = None) -> int:
 
     print_section("Firefly III")
     timezone_value = prompt_text("Timezone", default=existing.get("TZ", "Europe/Rome"))
-    network_name = prompt_text("Docker network where Firefly III is reachable", default=existing.get("FIREFLY_DOCKER_NETWORK", "firefly"))
-    firefly_base_url = prompt_text("Firefly III base URL", default=existing.get("FIREFLY_BASE_URL", "http://firefly:8080"))
+    print("")
+    print("Default connection mode: use a Firefly URL reachable from this container, such as your HTTPS domain.")
+    print("This keeps FIREFLY_DOCKER_NETWORK_EXTERNAL=false, so Compose creates this app's own network.")
+    print("Choose the Docker network option only when Firefly III runs in another Compose stack and you want direct container-to-container traffic.")
+    connection_mode = prompt_choice(
+        "How should the companion reach Firefly III?",
+        [
+            ("url", "Firefly URL or HTTPS domain (recommended)"),
+            ("docker", "Existing Docker network from another Firefly stack"),
+        ],
+        default="url",
+    )
+    if connection_mode == "docker":
+        network_name = prompt_text(
+            "Existing Docker network name",
+            default=existing.get("FIREFLY_DOCKER_NETWORK", "firefly"),
+        )
+        firefly_base_url = prompt_text(
+            "Firefly III internal base URL",
+            default=existing.get("FIREFLY_BASE_URL", "http://firefly:8080"),
+        )
+        firefly_network_external = "true"
+    else:
+        network_name = existing.get("FIREFLY_DOCKER_NETWORK", "firefly")
+        default_firefly_url = existing.get("FIREFLY_BASE_URL") or None
+        if default_firefly_url == "http://firefly:8080":
+            default_firefly_url = None
+        firefly_base_url = prompt_text("Firefly III base URL", default=default_firefly_url)
+        firefly_network_external = "false"
     firefly_api_path = prompt_text("Firefly III API base path", default=existing.get("FIREFLY_API_BASE_PATH", "/api/v1"))
     firefly_token = prompt_text("Firefly III personal access token", secret_input=True, plain_secrets=args.plain_secrets)
     firefly_token_expires_on = prompt_text(
@@ -463,7 +490,7 @@ def main(argv: list[str] | None = None) -> int:
         {
             "TZ": timezone_value,
             "FIREFLY_DOCKER_NETWORK": network_name,
-            "FIREFLY_DOCKER_NETWORK_EXTERNAL": env_values.get("FIREFLY_DOCKER_NETWORK_EXTERNAL", "false"),
+            "FIREFLY_DOCKER_NETWORK_EXTERNAL": firefly_network_external,
             "FIREFLY_BASE_URL": firefly_base_url,
             "FIREFLY_API_BASE_PATH": firefly_api_path,
             "PICOCLAW_PORT": "18790",

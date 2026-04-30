@@ -17,6 +17,16 @@ docker compose run --rm setup
 
 The wizard collects Firefly, Telegram, OCR, and safety defaults. It writes `.env`, `secrets/firefly_access_token.txt`, `secrets/telegram_bot_token.txt`, and seeded PicoClaw files in the `picoclaw_home` volume.
 
+For Firefly connectivity, the wizard defaults to URL mode. Use your HTTPS
+Firefly domain or another URL reachable from the companion container. This keeps
+`FIREFLY_DOCKER_NETWORK_EXTERNAL=false`, so Docker Compose creates this app's
+own network and does not require a pre-existing `firefly` network.
+
+Choose the existing Docker network mode only when Firefly III runs in another
+Compose stack and you want direct container-to-container traffic. In that mode,
+set `FIREFLY_DOCKER_NETWORK` to the network already used by the Firefly
+container and use an internal URL such as `http://firefly_iii_core:8080`.
+
 3. Start the companion.
 
 ```bash
@@ -59,6 +69,37 @@ On every start, `docker/entrypoint.sh`:
 9. starts `picoclaw gateway`
 
 The standalone Telegram command bot owns `/help`, `/commands`, `/balances`, `/summary`, `/recent`, and transaction draft flows. PicoClaw's native Telegram channel is disabled by default to avoid competing for the same bot token.
+
+## Firefly URL vs Docker Network
+
+Recommended:
+
+```env
+FIREFLY_BASE_URL=https://firefly.example.com
+FIREFLY_DOCKER_NETWORK_EXTERNAL=false
+```
+
+This calls Firefly III through its normal HTTP API endpoint. The companion
+Compose project owns its own network, so a fresh VPS can start without manually
+creating Docker networks.
+
+Advanced:
+
+```env
+FIREFLY_DOCKER_NETWORK=<existing-firefly-network>
+FIREFLY_DOCKER_NETWORK_EXTERNAL=true
+FIREFLY_BASE_URL=http://<firefly-container-name>:8080
+```
+
+With `FIREFLY_DOCKER_NETWORK_EXTERNAL=true`, Compose will not create the
+network. It must already exist. If the network name is wrong, startup fails with
+`network ... declared as external, but could not be found`.
+
+Find the network used by an existing Firefly container with:
+
+```bash
+docker inspect -f '{{range $name, $_ := .NetworkSettings.Networks}}{{println $name}}{{end}}' firefly_iii_core
+```
 
 ## Firefly Bridge
 
