@@ -470,4 +470,68 @@ PY
   fi
 fi
 
+if [[ -f "${PICOCLAW_CONFIG_DIR}/config.json" ]]; then
+  cp "${PICOCLAW_CONFIG_DIR}/config.json" "${PICOCLAW_HOME}/config.json"
+  chmod 0600 "${PICOCLAW_HOME}/config.json"
+fi
+
+python3 <<'PY'
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+
+forbidden = {
+    "telegram_bot_token",
+    "openai_api_key",
+    "anthropic_api_key",
+    "openrouter_api_key",
+    "groq_api_key",
+    "google_api_key",
+    "pdfapihub_api_key",
+}
+
+
+def scrub(value):
+    if isinstance(value, dict):
+        return {key: scrub(item) for key, item in value.items() if key not in forbidden}
+    if isinstance(value, list):
+        return [scrub(item) for item in value]
+    return value
+
+
+def find_forbidden(value, path="$"):
+    matches = []
+    if isinstance(value, dict):
+        for key, item in value.items():
+            current = f"{path}.{key}"
+            if key in forbidden:
+                matches.append(current)
+            matches.extend(find_forbidden(item, current))
+    elif isinstance(value, list):
+        for index, item in enumerate(value):
+            matches.extend(find_forbidden(item, f"{path}[{index}]"))
+    return matches
+
+
+paths = [
+    Path(os.getenv("PICOCLAW_CONFIG_DIR", "/home/picoclaw/.picoclaw")) / "config.json",
+    Path(os.getenv("PICOCLAW_HOME", "/home/picoclaw")) / "config.json",
+]
+
+for path in paths:
+    if not path.exists():
+        continue
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    cleaned = scrub(payload)
+    remaining = find_forbidden(cleaned)
+    if remaining:
+        raise SystemExit(f"{path} still contains forbidden config keys after scrub: {remaining}")
+    path.write_text(json.dumps(cleaned, indent=2, sort_keys=False) + "\n", encoding="utf-8")
+    path.chmod(0o600)
+    top_level = sorted(cleaned) if isinstance(cleaned, dict) else []
+    print(f"Sanitized PicoClaw config before startup: {path} keys={top_level}", flush=True)
+PY
+
 exec "$@"
