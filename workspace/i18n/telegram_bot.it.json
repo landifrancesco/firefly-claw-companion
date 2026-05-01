@@ -15,6 +15,7 @@
     "startup_ok": "Firefly bridge sano. Bot pronto. /help mostra cosa puoi chiedermi.",
     "startup_warn": "Firefly bridge avviato con avviso. /help mostra cosa puoi chiedermi.",
     "startup_gateway_unhealthy": "Sono partito, ma il gateway PicoClaw non e ancora sano su localhost:18790. Controlla i log di docker compose.",
+    "live_ping_ok": "Controllo programmato:",
     "need_more_detail": "Mi serve un po' piu di dettaglio per farlo in sicurezza.",
     "no_pending_draft": "Non c'e nessuna bozza in attesa da confermare.",
     "receipt_unreadable": "Non sono ancora riuscito a leggere quello scontrino in modo sicuro. Invia una breve nota con l'immagine, per esempio 'scontrino caffe pagato in contanti', oppure scrivi la spesa normalmente.",
@@ -39,7 +40,8 @@
     "command_lines": [
       "/aiuto - esempi in linguaggio naturale",
       "/comandi - lista comandi",
-      "/configura - insegna conti predefiniti, alias carta/contanti e comportamento budget; accetta status o reset",
+      "/configura - mostra il profilo finanziario; accetta status/reset/start",
+      "/impara - insegna conti predefiniti, alias carta/contanti e comportamento budget",
       "/aggiungi - inserimento transazione guidato",
       "/saldi - saldi dei conti",
       "/conti, /categorie, /budget, /ricorrenze - dati di riferimento Firefly",
@@ -48,12 +50,12 @@
       "/cerca <parola chiave> - cerca transazioni degli ultimi 90 giorni",
       "/principali, /reportbudget - report spese e budget; accetta mese, grafico o intervallo date",
       "/grafico - grafici saldi, spese e flusso di cassa",
-      "/setbudgetlimit budget=\"Spesa\" amount=350 month=2026-04",
-      "/expense, /income, /transfer - bozze dirette con importo, descrizione, conto origine, conto destinazione, categoria e budget",
-      "/newcategory, /newbudget, /newaccount - crea elementi di riferimento Firefly",
+      "/impostabudget budget=\"Spesa\" amount=350 month=2026-04",
+      "/spesa, /entrata, /trasferimento - bozze dirette con importo, descrizione, conto origine, conto destinazione, categoria e budget",
+      "/nuovacategoria, /nuovobudget, /nuovoconto - crea elementi di riferimento Firefly",
       "/esporta - invia un backup JSON in questa chat",
       "/manutenzione - pulizia di conti, categorie e budget",
-      "/undo - ripristina l'ultima azione in bozza"
+      "/annulla - annulla la bozza o il flusso corrente"
     ],
     "help_natural_examples": [
       "quanti soldi ho",

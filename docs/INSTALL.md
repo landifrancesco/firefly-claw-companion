@@ -50,9 +50,13 @@ The default generated model uses Google AI Studio with Gemini 2.5 Flash:
 {
   "model_name": "gemini",
   "model": "gemini/gemini-2.5-flash",
-  "auth_method": "api_key"
+  "enabled": true
 }
 ```
+
+The API key is written to PicoClaw's nested `.security.yml` under
+`model_list.gemini.api_keys` and the migrated alias `model_list.gemini:0.api_keys`,
+not to `config.json`.
 
 ## Bootstrap Details
 

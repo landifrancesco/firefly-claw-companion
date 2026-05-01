@@ -15,6 +15,7 @@
     "startup_ok": "Firefly bridge is healthy. Bot ready. /help shows what you can ask.",
     "startup_warn": "Firefly bridge started with a warning. /help shows what you can ask.",
     "startup_gateway_unhealthy": "I started, but the PicoClaw gateway is still not healthy on localhost:18790. Check docker compose logs.",
+    "live_ping_ok": "Scheduled live check:",
     "need_more_detail": "I need a bit more detail to do that safely.",
     "no_pending_draft": "There is no pending draft to commit.",
     "receipt_unreadable": "I could not read that receipt safely yet. Send a short note with the image, for example 'receipt for coffee paid with cash', or type the expense normally.",
@@ -39,7 +40,8 @@
     "command_lines": [
       "/help - natural-language examples",
       "/commands - this command list",
-      "/train, /setup - teach account defaults, payment aliases, and budget behavior; /setup accepts status or reset",
+      "/setup - show the current finance profile; accepts status/reset/start",
+      "/train - teach account defaults, payment aliases, and budget behavior",
       "/add - guided transaction entry",
       "/balances - account balances",
       "/accounts, /categories, /budgets, /recurrences - Firefly reference data",

@@ -11,6 +11,9 @@ BIN_ROOT="${BIN_ROOT:-/opt/firefly-picoclaw/bin}"
 RUNTIME_PORT="${PICOCLAW_PORT:-18790}"
 RUNTIME_HOST="${PICOCLAW_GATEWAY_HOST:-127.0.0.1}"
 VERIFY_ON_BOOT="${FIREFLY_RUNTIME_VERIFY_ON_BOOT:-true}"
+ENTRYPOINT_BUILD_MARKER="config-scrub-v2"
+
+echo "firefly-picoclaw entrypoint ${ENTRYPOINT_BUILD_MARKER}" >&2
 
 read_secret() {
   local variable_name="$1"
@@ -61,6 +64,70 @@ archive_legacy_openclaw_state() {
     mv "${legacy_dir}" "${archive_dir}"
     echo "Archived incompatible OpenClaw state at ${archive_dir}; PicoClaw uses ${PICOCLAW_CONFIG_DIR}." >&2
   fi
+}
+
+scrub_picoclaw_config() {
+  local phase="${1:-manual}"
+  python3 - "${phase}" <<'PY'
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+import sys
+
+phase = sys.argv[1]
+forbidden = {
+    "telegram_bot_token",
+    "openai_api_key",
+    "anthropic_api_key",
+    "openrouter_api_key",
+    "groq_api_key",
+    "google_api_key",
+    "pdfapihub_api_key",
+}
+
+
+def scrub(value):
+    if isinstance(value, dict):
+        return {key: scrub(item) for key, item in value.items() if key not in forbidden}
+    if isinstance(value, list):
+        return [scrub(item) for item in value]
+    return value
+
+
+def find_forbidden(value, path="$"):
+    matches = []
+    if isinstance(value, dict):
+        for key, item in value.items():
+            current = f"{path}.{key}"
+            if key in forbidden:
+                matches.append(current)
+            matches.extend(find_forbidden(item, current))
+    elif isinstance(value, list):
+        for index, item in enumerate(value):
+            matches.extend(find_forbidden(item, f"{path}[{index}]"))
+    return matches
+
+
+paths = [
+    Path(os.getenv("PICOCLAW_CONFIG_DIR", "/home/picoclaw/.picoclaw")) / "config.json",
+    Path(os.getenv("PICOCLAW_HOME", "/home/picoclaw")) / "config.json",
+]
+
+for path in paths:
+    if not path.exists():
+        continue
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    cleaned = scrub(payload)
+    remaining = find_forbidden(cleaned)
+    if remaining:
+        raise SystemExit(f"{path} still contains forbidden config keys after scrub: {remaining}")
+    path.write_text(json.dumps(cleaned, indent=2, sort_keys=False) + "\n", encoding="utf-8")
+    path.chmod(0o600)
+    top_level = sorted(cleaned) if isinstance(cleaned, dict) else []
+    print(f"scrub_picoclaw_config phase={phase} path={path} keys={top_level}", flush=True)
+PY
 }
 
 ensure_dir "${PICOCLAW_HOME}" 700
@@ -122,6 +189,46 @@ export GROQ_API_KEY="${GROQ_TOKEN}"
 export GOOGLE_API_KEY="${GOOGLE_TOKEN}"
 export PDFAPIHUB_API_KEY="${PDFAPIHUB_TOKEN}"
 
+required_model_secret=""
+required_model_secret_name=""
+case "${PICOCLAW_DEFAULT_MODEL_NAME}" in
+  gemini|google)
+    required_model_secret="${GOOGLE_TOKEN}"
+    required_model_secret_name="GOOGLE_API_KEY"
+    ;;
+  groq)
+    required_model_secret="${GROQ_TOKEN}"
+    required_model_secret_name="GROQ_API_KEY"
+    ;;
+  openai)
+    required_model_secret="${OPENAI_TOKEN}"
+    required_model_secret_name="OPENAI_API_KEY"
+    ;;
+  anthropic)
+    required_model_secret="${ANTHROPIC_TOKEN}"
+    required_model_secret_name="ANTHROPIC_API_KEY"
+    ;;
+  openrouter)
+    required_model_secret="${OPENROUTER_TOKEN}"
+    required_model_secret_name="OPENROUTER_API_KEY"
+    ;;
+  codex)
+    required_model_secret_name=""
+    ;;
+  *)
+    echo "Error: unsupported PICOCLAW_DEFAULT_MODEL_NAME=${PICOCLAW_DEFAULT_MODEL_NAME}." >&2
+    echo "Use one of: gemini, groq, openai, anthropic, openrouter, codex." >&2
+    exit 16
+    ;;
+esac
+
+if [[ -n "${required_model_secret_name}" && -z "${required_model_secret}" ]]; then
+  echo "Error: PICOCLAW_DEFAULT_MODEL_NAME=${PICOCLAW_DEFAULT_MODEL_NAME} requires ${required_model_secret_name}, but it is empty." >&2
+  echo "Set ${required_model_secret_name} in .env or secrets/, or choose a provider whose key is configured." >&2
+  echo "For your current .env, either add GOOGLE_API_KEY for Gemini or set PICOCLAW_DEFAULT_MODEL_NAME=groq and PICOCLAW_DEFAULT_MODEL=groq/openai/gpt-oss-20b." >&2
+  exit 16
+fi
+
 if [[ "${TELEGRAM_ENABLED}" == "true" && -z "${TELEGRAM_TOKEN}" ]]; then
   echo "Error: TELEGRAM_ENABLED=true but no Telegram bot token was provided." >&2
   exit 14
@@ -156,37 +263,15 @@ telegram_enabled = os.getenv("PICOCLAW_TELEGRAM_CHANNEL_ENABLED", "false").strip
 model_name = os.getenv("PICOCLAW_DEFAULT_MODEL_NAME", "gemini")
 model_string = os.getenv("PICOCLAW_DEFAULT_MODEL", "gemini/gemini-2.5-flash")
 
-# Determine auth method and API key reference based on provider.
-auth_method = "api_key"
-api_key_ref = None
-
-if model_name == "codex":
-    auth_method = "oauth"
-elif model_name == "groq":
-    auth_method = "api_key"
-    api_key_ref = "ref:groq_api_key"
-elif model_name == "openai":
-    auth_method = "api_key"
-    api_key_ref = "ref:openai_api_key"
-elif model_name == "anthropic":
-    auth_method = "api_key"
-    api_key_ref = "ref:anthropic_api_key"
-elif model_name == "openrouter":
-    auth_method = "api_key"
-    api_key_ref = "ref:openrouter_api_key"
-elif model_name in {"google", "gemini"}:
-    auth_method = "api_key"
-    api_key_ref = "ref:google_api_key"
-
 model_config = {
     "model_name": model_name,
     "model": model_string,
-    "auth_method": auth_method,
 }
-if api_key_ref:
-    model_config["api_key"] = api_key_ref
+if model_name == "codex":
+    model_config["auth_method"] = "oauth"
 
 config = {
+    "version": 2,
     "agents": {
         "defaults": {
             "workspace": str(workspace),
@@ -202,7 +287,6 @@ config = {
     "channels": {
         "telegram": {
             "enabled": telegram_enabled,
-            "token": "ref:telegram_bot_token",
             "allow_from": [telegram_owner] if telegram_owner else [],
             "use_markdown_v2": False,
             "streaming": {"enabled": True},
@@ -267,15 +351,30 @@ config_path = config_dir / "config.json"
 config_path.write_text(json.dumps(config, indent=2, sort_keys=False) + "\n", encoding="utf-8")
 config_path.chmod(0o600)
 
+model_key = ""
+if model_name == "groq":
+    model_key = os.getenv("GROQ_API_KEY", "")
+elif model_name == "openai":
+    model_key = os.getenv("OPENAI_API_KEY", "")
+elif model_name == "anthropic":
+    model_key = os.getenv("ANTHROPIC_API_KEY", "")
+elif model_name == "openrouter":
+    model_key = os.getenv("OPENROUTER_API_KEY", "")
+elif model_name in {"google", "gemini"}:
+    model_key = os.getenv("GOOGLE_API_KEY", "")
+
 security = {
-    "telegram_bot_token": os.getenv("TELEGRAM_BOT_TOKEN", ""),
-    "openai_api_key": os.getenv("OPENAI_API_KEY", ""),
-    "anthropic_api_key": os.getenv("ANTHROPIC_API_KEY", ""),
-    "openrouter_api_key": os.getenv("OPENROUTER_API_KEY", ""),
-    "groq_api_key": os.getenv("GROQ_API_KEY", ""),
-    "google_api_key": os.getenv("GOOGLE_API_KEY", ""),
-    "pdfapihub_api_key": os.getenv("PDFAPIHUB_API_KEY", ""),
+    "model_list": {},
+    "channels": {
+        "telegram": {
+            "token": os.getenv("TELEGRAM_BOT_TOKEN", ""),
+        },
+    },
 }
+if model_key:
+    model_secret = {"api_keys": [model_key]}
+    security["model_list"][model_name] = model_secret
+    security["model_list"][f"{model_name}:0"] = model_secret
 (config_dir / ".security.yml").write_text(yaml.safe_dump(security, sort_keys=False), encoding="utf-8")
 (config_dir / ".security.yml").chmod(0o600)
 
@@ -290,6 +389,7 @@ PY
 cp "${PICOCLAW_CONFIG_DIR}/config.json" "${PICOCLAW_HOME}/config.json"
 cp "${PICOCLAW_CONFIG_DIR}/.security.yml" "${PICOCLAW_HOME}/.security.yml"
 chmod 0600 "${PICOCLAW_HOME}/config.json" "${PICOCLAW_HOME}/.security.yml"
+scrub_picoclaw_config "before-migration"
 
 # Older companion builds accidentally allowed flat secret keys to survive in
 # config.json. Newer PicoClaw rejects those keys before migration, so clean both
@@ -333,47 +433,6 @@ for path in paths:
     if changed:
         path.write_text(json.dumps(payload, indent=2, sort_keys=False) + "\n", encoding="utf-8")
         path.chmod(0o600)
-PY
-
-# Force schema migration before gateway startup, then replace migrated secret
-# placeholders with actual values. PicoClaw v3 stores secrets in a nested shape
-# matching config.json, not in the flat legacy file generated above.
-picoclaw status >/dev/null 2>&1 || true
-
-python3 <<'PY'
-from __future__ import annotations
-
-import os
-from pathlib import Path
-
-import yaml
-
-home = Path(os.getenv("PICOCLAW_HOME", "/home/picoclaw"))
-security_path = home / ".security.yml"
-security = yaml.safe_load(security_path.read_text(encoding="utf-8")) if security_path.exists() else {}
-if not isinstance(security, dict):
-    security = {}
-
-channel_list = security.setdefault("channel_list", {})
-telegram = channel_list.setdefault("telegram", {})
-telegram_settings = telegram.setdefault("settings", {})
-telegram_settings["token"] = os.getenv("TELEGRAM_BOT_TOKEN", "")
-
-model_name = os.getenv("PICOCLAW_DEFAULT_MODEL_NAME", "gemini")
-model_secrets = {
-    "groq": os.getenv("GROQ_API_KEY", ""),
-    "openai": os.getenv("OPENAI_API_KEY", ""),
-    "anthropic": os.getenv("ANTHROPIC_API_KEY", ""),
-    "openrouter": os.getenv("OPENROUTER_API_KEY", ""),
-    "google": os.getenv("GOOGLE_API_KEY", ""),
-    "gemini": os.getenv("GOOGLE_API_KEY", ""),
-}
-if model_name in model_secrets:
-    model_list = security.setdefault("model_list", {})
-    model_list[f"{model_name}:0"] = {"api_keys": [model_secrets[model_name]]}
-
-security_path.write_text(yaml.safe_dump(security, sort_keys=False), encoding="utf-8")
-security_path.chmod(0o600)
 PY
 
 python3 <<'PY'
@@ -474,6 +533,7 @@ if [[ -f "${PICOCLAW_CONFIG_DIR}/config.json" ]]; then
   cp "${PICOCLAW_CONFIG_DIR}/config.json" "${PICOCLAW_HOME}/config.json"
   chmod 0600 "${PICOCLAW_HOME}/config.json"
 fi
+scrub_picoclaw_config "before-exec"
 
 python3 <<'PY'
 from __future__ import annotations

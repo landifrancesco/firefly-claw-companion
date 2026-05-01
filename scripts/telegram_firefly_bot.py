@@ -41,11 +41,22 @@ from firefly_companion.object_cache import FireflyObjectCache
 from firefly_companion.receipt_parser import count_visible_transactions
 
 
+def env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except ValueError:
+        return default
+
+
 STATE_PATH = Path(os.getenv("PICOCLAW_CONFIG_DIR", str(Path.home() / ".picoclaw"))) / "telegram-bot-state.json"
 POLL_TIMEOUT_SECONDS = 30
 ALLOWED_PRIVATE_CHAT_TYPES = {"private"}
 TELEGRAM_TEXT_LIMIT = 3900
 TELEGRAM_CAPTION_LIMIT = 1024
+SETUP_ACCOUNT_CHOICE_LIMIT = env_int("TELEGRAM_SETUP_ACCOUNT_LIMIT", 50)
+STARTUP_HEALTHCHECK_ENABLED = os.getenv("TELEGRAM_STARTUP_HEALTHCHECK_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+LIVE_PING_ENABLED = os.getenv("TELEGRAM_LIVE_PING_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+LIVE_PING_TIME = os.getenv("TELEGRAM_LIVE_PING_TIME", "09:00").strip()
 ITALIC_MARKER_PATTERN = re.compile(r"(?<!\w)_(?!\s)([^_\n]+?)(?<!\s)_(?!\w)")
 AUTOFILL_CACHE_SECONDS = 600
 PROFILE_SETUP_STEPS = (
@@ -433,6 +444,14 @@ def bot_text(key: str, *, source_text: str | None = None, **kwargs: Any) -> str:
     return conversation_module.bot_text(key, source_text=source_text, **kwargs)
 
 
+def bot_text_or_default(key: str, default_en: str, default_it: str, *, source_text: str | None = None, **kwargs: Any) -> str:
+    try:
+        return bot_text(key, source_text=source_text, **kwargs)
+    except KeyError:
+        value = localize(default_en, default_it, source_text=source_text)
+        return value.format(**kwargs) if kwargs else value
+
+
 def bot_list(key: str, *, source_text: str | None = None) -> list[str]:
     conversation_module.set_locale_dir(LOCALE_DIR)
     return conversation_module.bot_list(key, source_text=source_text)
@@ -549,6 +568,7 @@ COMMAND_ALIASES: dict[str, str] = {
     "/recenti":      "/recent",
     "/principali":   "/topcategories",
     "/reportbudget": "/budgetreport",
+    "/impostabudget": "/setbudgetlimit",
     "/manutenzione": "/maintenance",
     "/cerca":        "/search",
     "/salute":       "/health",
@@ -563,6 +583,12 @@ COMMAND_ALIASES: dict[str, str] = {
     "/budget":       "/budgets",
     "/ricorrenze":   "/recurrences",
     "/grafico":      "/graph",
+    "/spesa":        "/expense",
+    "/entrata":      "/income",
+    "/trasferimento": "/transfer",
+    "/nuovacategoria": "/newcategory",
+    "/nuovobudget":  "/newbudget",
+    "/nuovoconto":   "/newaccount",
     "/stop":         "/cancel",
 }
 
@@ -571,10 +597,11 @@ def ensure_telegram_commands(bot_token: str) -> None:
     commands_en = [
         {"command": "help", "description": "Help and examples"},
         {"command": "commands", "description": "Full command list"},
-        {"command": "train", "description": "Teach account aliases and defaults"},
-        {"command": "setup", "description": "Setup account/budget profile"},
+        {"command": "setup", "description": "Show or reset finance profile"},
+        {"command": "train", "description": "Teach account defaults and aliases"},
         {"command": "add", "description": "Interactive transaction add"},
         {"command": "balances", "description": "Show balances"},
+        {"command": "health", "description": "Health check"},
         {"command": "summary", "description": "Monthly/custom summary"},
         {"command": "recent", "description": "Recent transactions"},
         {"command": "search", "description": "Search transactions by keyword"},
@@ -586,14 +613,16 @@ def ensure_telegram_commands(bot_token: str) -> None:
     commands_it = [
         {"command": "aiuto", "description": "Aiuto ed esempi"},
         {"command": "comandi", "description": "Lista comandi completa"},
-        {"command": "configura", "description": "Configura profilo conti e budget"},
+        {"command": "configura", "description": "Mostra o resetta il profilo"},
+        {"command": "impara", "description": "Insegna conti e alias"},
         {"command": "aggiungi", "description": "Aggiunta transazione guidata"},
         {"command": "saldi", "description": "Mostra saldi"},
+        {"command": "salute", "description": "Controllo stato"},
         {"command": "riepilogo", "description": "Riepilogo mese o intervallo"},
         {"command": "recenti", "description": "Transazioni recenti"},
         {"command": "cerca", "description": "Cerca transazioni per parola chiave"},
         {"command": "principali", "description": "Categorie principali per spesa"},
-        {"command": "budgetreport", "description": "Report budget"},
+        {"command": "reportbudget", "description": "Report budget"},
         {"command": "grafico", "description": "Grafici saldi, spese o flusso"},
         {"command": "esporta", "description": "Invia backup JSON"},
         {"command": "manutenzione", "description": "Modalita manutenzione"},
@@ -614,6 +643,15 @@ def ensure_telegram_commands(bot_token: str) -> None:
             "commands": json.dumps(commands_it, ensure_ascii=False),
             "scope": json.dumps({"type": "all_private_chats"}),
             "language_code": "it",
+        },
+    )
+    default_commands = commands_it if configured_chat_language() == "it" else commands_en
+    telegram_request(
+        bot_token,
+        "setMyCommands",
+        data={
+            "commands": json.dumps(default_commands, ensure_ascii=False),
+            "scope": json.dumps({"type": "all_private_chats"}),
         },
     )
 
@@ -886,11 +924,42 @@ def format_transaction_batch_preview(
 def format_duplicate_blocked(duplicate: dict[str, Any], *, source_text: str | None = None) -> str:
     return localize(
         "Blocked as a likely duplicate.\n"
-        f"{format_display_date(str(duplicate.get('date', ''))[:10])} | {duplicate.get('amount')} | {duplicate.get('description')}",
+        f"{format_display_date(str(duplicate.get('date', ''))[:10])} | {format_money(duplicate.get('amount'))} | {duplicate.get('description')}",
         "Bloccata come possibile duplicato.\n"
-        f"{format_display_date(str(duplicate.get('date', ''))[:10])} | {duplicate.get('amount')} | {duplicate.get('description')}",
+        f"{format_display_date(str(duplicate.get('date', ''))[:10])} | {format_money(duplicate.get('amount'))} | {duplicate.get('description')}",
         source_text=source_text,
     )
+
+
+def _first_payload_transaction(payload: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        return {}
+    transactions = payload.get("transactions")
+    if isinstance(transactions, list) and transactions and isinstance(transactions[0], dict):
+        return transactions[0]
+    return {}
+
+
+def _merged_created_transaction(result: dict[str, Any], fallback_payload: dict[str, Any] | None) -> dict[str, Any]:
+    fallback_tx = _first_payload_transaction(fallback_payload)
+    data = result.get("data")
+    if isinstance(data, dict):
+        attributes = data.get("attributes", {})
+        transactions = attributes.get("transactions", [])
+        if isinstance(transactions, list) and transactions and isinstance(transactions[0], dict):
+            tx = dict(fallback_tx)
+            tx.update({key: value for key, value in transactions[0].items() if value not in (None, "")})
+            if not tx.get("description") and attributes.get("group_title"):
+                tx["description"] = attributes.get("group_title")
+            return tx
+    return dict(fallback_tx)
+
+
+def _field_or_missing(value: Any, *, source_text: str | None = None) -> str:
+    text = str(value or "").strip()
+    if text:
+        return text
+    return localize("not set", "non impostato", source_text=source_text)
 
 
 def format_created_transaction_result(
@@ -904,34 +973,22 @@ def format_created_transaction_result(
         "Transazione creata con successo.",
         source_text=source_text,
     )
-    data = result.get("data")
-    if isinstance(data, dict):
-        attributes = data.get("attributes", {})
-        transactions = attributes.get("transactions", [])
-        if transactions:
-            tx = transactions[0]
-            date_value = format_display_date(str(tx.get("date", ""))[:10])
-            type_label = localized_transaction_type(tx.get("type", "transaction"), source_text=source_text)
-            amount_label = format_money(tx.get("amount"))
-            headline = localize(
-                f"{type_label} {amount_label} on {date_value}",
-                f"{type_label} {amount_label} del {date_value}",
-                source_text=source_text,
-            )
-            return (
-                f"{success_title}\n"
-                f"{headline}\n"
-                f"{tx.get('description') or attributes.get('group_title') or 'No description'}\n"
-                f"{tx.get('source_name', '-') or '-'} -> {tx.get('destination_name', '-') or '-'}"
-            )
-
-    if fallback_payload:
-        return format_transaction_preview(
-            fallback_payload,
-            intro=success_title,
-            outro="",
-            source_text=source_text,
-        ).rstrip()
+    tx = _merged_created_transaction(result, fallback_payload)
+    if tx:
+        lines = [
+            success_title,
+            "",
+            f"{localize('Type', 'Tipo', source_text=source_text)}: {localized_transaction_type(tx.get('type', 'transaction'), source_text=source_text)}",
+            f"{localize('Amount', 'Importo', source_text=source_text)}: {format_money(tx.get('amount'))}",
+            f"{localize('Date', 'Data', source_text=source_text)}: {format_display_date(str(tx.get('date', ''))[:10])}",
+            f"{localize('Description', 'Descrizione', source_text=source_text)}: {_field_or_missing(tx.get('description'), source_text=source_text)}",
+            f"{localize('From', 'Da', source_text=source_text)}: {_field_or_missing(tx.get('source_name'), source_text=source_text)}",
+            f"{localize('To', 'A', source_text=source_text)}: {_field_or_missing(tx.get('destination_name'), source_text=source_text)}",
+            f"{localize('Category', 'Categoria', source_text=source_text)}: {_field_or_missing(tx.get('category_name'), source_text=source_text)}",
+            f"Budget: {_field_or_missing(tx.get('budget_name'), source_text=source_text)}",
+            f"{localize('Mode', 'Modalita', source_text=source_text)}: live",
+        ]
+        return "\n".join(lines)
 
     return success_title
 
@@ -1005,20 +1062,17 @@ def match_choice(value: str, choices: list[str]) -> str | None:
 
 def unique_usable_names(names: list[str], *, limit: int) -> list[str]:
     result: list[str] = []
-    seen: set[str] = set()
     for name in names:
         clean = usable_account_name(name)
-        key = normalize_match_text(clean)
-        if not clean or key in seen:
+        if not clean:
             continue
         result.append(clean)
-        seen.add(key)
         if len(result) >= limit:
             break
     return result
 
 
-def account_choice_list(service: BridgeService, *, account_type: str = "all", limit: int = 12) -> list[str]:
+def account_choice_list(service: BridgeService, *, account_type: str = "all", limit: int = SETUP_ACCOUNT_CHOICE_LIMIT) -> list[str]:
     if account_type == "all":
         cache = FireflyObjectCache(service.client)
         names = cache.accounts() or summarize_name_list(service.client.list_accounts("all"), limit=limit * 2)
@@ -1034,7 +1088,7 @@ def account_choice_list(service: BridgeService, *, account_type: str = "all", li
     return account_choice_list(service, account_type="all", limit=limit)
 
 
-def setup_account_choices_for_step(service: BridgeService, step: str, *, limit: int = 12) -> list[str]:
+def setup_account_choices_for_step(service: BridgeService, step: str, *, limit: int = SETUP_ACCOUNT_CHOICE_LIMIT) -> list[str]:
     account_type_by_step = {
         "expense_source_account": "asset",
         "expense_destination_account": "expense",
@@ -1064,10 +1118,7 @@ def intent_account_choices(service: BridgeService, intent: str, field: str, *, l
 
 
 def usable_account_name(value: Any) -> str:
-    name = str(value or "").strip()
-    if normalize_natural_text(name) in {"account", "accounts", "conto", "conti"}:
-        return ""
-    return name
+    return str(value or "").strip()
 
 
 def parse_yes_no(value: str) -> bool | None:
@@ -1136,11 +1187,28 @@ def finance_profile_summary(state: dict[str, Any], *, source_text: str | None = 
 
 
 def start_finance_setup(service: BridgeService, state: dict[str, Any], *, source_text: str | None = None) -> BotResponse:
+    state.pop("add_flow", None)
+    state.pop("maintenance_mode", None)
+    state.pop("pending_transaction_resolution", None)
     state["profile_setup"] = {
         "step_index": 0,
         "profile": get_finance_profile(state),
     }
     return BotResponse(build_finance_setup_prompt(service, state, source_text=source_text))
+
+
+def setup_overview_text(state: dict[str, Any], *, source_text: str | None = None) -> str:
+    intro = localize(
+        "Current setup is active." if finance_profile_ready(state) else "No complete finance profile yet.",
+        "La configurazione attuale e attiva." if finance_profile_ready(state) else "Non c'e ancora un profilo finanziario completo.",
+        source_text=source_text,
+    )
+    hint = localize(
+        "Use /train to teach accounts and aliases. Use /setup reset to clear the profile.",
+        "Usa /impara per insegnare conti e alias. Usa /configura reset per cancellare il profilo.",
+        source_text=source_text,
+    )
+    return f"{intro}\n\n{finance_profile_summary(state, source_text=source_text)}\n\n{hint}"
 
 
 def build_finance_setup_prompt(service: BridgeService, state: dict[str, Any], *, source_text: str | None = None) -> str:
@@ -5314,13 +5382,13 @@ def process_message(service: BridgeService, text: str, state: dict[str, Any]) ->
     if add_response is not None:
         return add_response
 
-    maintenance_response = handle_maintenance_message(service, state, text)
-    if maintenance_response is not None:
-        return maintenance_response
-
     setup_response = handle_finance_setup_message(service, state, text)
     if setup_response is not None:
         return setup_response
+
+    maintenance_response = handle_maintenance_message(service, state, text)
+    if maintenance_response is not None:
+        return maintenance_response
 
     resolution_response = handle_pending_transaction_resolution(service, state, text)
     if resolution_response is not None:
@@ -5504,22 +5572,31 @@ def process_message(service: BridgeService, text: str, state: dict[str, Any]) ->
         start_maintenance_mode(state, source_text=text)
         return BotResponse(maintenance_menu_text(source_text=text))
 
-    if command in {"/setup", "/train"}:
+    if command == "/setup":
+        state.pop("maintenance_mode", None)
+        state.pop("add_flow", None)
         action = normalize_natural_text(tail)
         if action == "status":
-            return BotResponse(finance_profile_summary(state, source_text=text))
+            return BotResponse(setup_overview_text(state, source_text=text))
         if action in {"reset", "restart"}:
             state.pop("finance_profile", None)
             state.pop("profile_setup", None)
+            return BotResponse(
+                localize(
+                    "Finance profile reset. Use /train to teach accounts again.",
+                    "Profilo finanziario cancellato. Usa /impara per insegnare di nuovo i conti.",
+                    source_text=text,
+                )
+            )
+        if action in {"start", "train", "impara", "allena"}:
             return start_finance_setup(service, state, source_text=text)
-        if command == "/setup" and finance_profile_ready(state) and action not in {"", "start"}:
-            return BotResponse(finance_profile_summary(state, source_text=text))
+        return BotResponse(setup_overview_text(state, source_text=text))
+
+    if command == "/train":
         return start_finance_setup(service, state, source_text=text)
 
     if command == "/health":
-        payload = service.client.health()
-        version = payload.get("data", {}).get("version") or payload.get("version") or "unknown"
-        return BotResponse(localize(f"Firefly bridge is healthy.\nVersion: {version}", f"Il bridge Firefly è sano.\nVersione: {version}", source_text=text))
+        return BotResponse(build_health_message(service, source_text=text))
 
     if command == "/backup":
         document_path, filename, backup = create_firefly_backup_document(service)
@@ -5949,9 +6026,75 @@ def boot_state_validator(state: dict) -> int:
     return cleaned
 
 
+def build_health_message(service: BridgeService, *, source_text: str | None = None, prefix_key: str | None = None) -> str:
+    selected_prefix = prefix_key
+    try:
+        payload = service.client.health()
+        version = payload.get("data", {}).get("version") or payload.get("version") or "unknown"
+        body = localize(
+            f"Firefly bridge is healthy.\nVersion: {version}",
+            f"Il bridge Firefly e sano.\nVersione: {version}",
+            source_text=source_text,
+        )
+    except Exception as exc:
+        if prefix_key == "startup_ok":
+            selected_prefix = "startup_warn"
+        body = localize(
+            f"Firefly bridge health check failed: {exc}",
+            f"Controllo salute Firefly bridge fallito: {exc}",
+            source_text=source_text,
+        )
+    prefix = ""
+    if selected_prefix == "live_ping_ok":
+        prefix = bot_text_or_default("live_ping_ok", "Scheduled live check:", "Controllo programmato:", source_text=source_text)
+    elif selected_prefix == "startup_ok":
+        prefix = bot_text_or_default(
+            "startup_ok",
+            "Firefly bridge is healthy. Bot ready. /help shows what you can ask.",
+            "Firefly bridge sano. Bot pronto. /help mostra cosa puoi chiedermi.",
+            source_text=source_text,
+        )
+    elif selected_prefix == "startup_warn":
+        prefix = bot_text_or_default(
+            "startup_warn",
+            "Firefly bridge started with a warning. /help shows what you can ask.",
+            "Firefly bridge avviato con un avviso. /help mostra cosa puoi chiedermi.",
+            source_text=source_text,
+        )
+    elif selected_prefix:
+        prefix = bot_text_or_default(selected_prefix, "", "", source_text=source_text)
+    return f"{prefix}\n{body}".strip()
+
+
+def parse_live_ping_time(value: str) -> tuple[int, int] | None:
+    match = re.fullmatch(r"([01]?\d|2[0-3]):([0-5]\d)", value.strip())
+    if not match:
+        return None
+    return int(match.group(1)), int(match.group(2))
+
+
+def maybe_send_live_ping(bot_token: str, chat_id: str, service: BridgeService, state: dict[str, Any]) -> None:
+    if not LIVE_PING_ENABLED:
+        return
+    scheduled = parse_live_ping_time(LIVE_PING_TIME)
+    if scheduled is None:
+        return
+    now = datetime.now()
+    hour, minute = scheduled
+    if (now.hour, now.minute) < (hour, minute):
+        return
+    today_key = now.date().isoformat()
+    if state.get("last_live_ping_date") == today_key:
+        return
+    send_message(bot_token, chat_id, build_health_message(service, source_text=configured_chat_language(), prefix_key="live_ping_ok"))
+    state["last_live_ping_date"] = today_key
+    save_state(state)
+
+
 def main() -> int:
     bot_token = os.getenv("FIREFLY_TELEGRAM_BOT_TOKEN", os.getenv("TELEGRAM_BOT_TOKEN", "")).strip()
     owner_id = os.getenv("FIREFLY_TELEGRAM_OWNER_ID", os.getenv("TELEGRAM_OWNER_ID", "")).strip()
+    target_id = os.getenv("FIREFLY_TELEGRAM_TARGET_ID", os.getenv("TELEGRAM_TARGET_ID", owner_id)).strip() or owner_id
     if not bot_token or not owner_id:
         print("telegram_firefly_bot: TELEGRAM_BOT_TOKEN and TELEGRAM_OWNER_ID are required.", file=sys.stderr)
         return 0
@@ -5971,9 +6114,15 @@ def main() -> int:
         save_state(state)
     offset = int(state.get("offset", 0))
     initialized = bool(state.get("initialized", False))
+    if STARTUP_HEALTHCHECK_ENABLED:
+        try:
+            send_message(bot_token, target_id, build_health_message(service, source_text=configured_chat_language(), prefix_key="startup_ok"))
+        except TelegramBotError as exc:
+            print(f"telegram_firefly_bot: startup health notification failed: {exc}", file=sys.stderr)
 
     while True:
         try:
+            maybe_send_live_ping(bot_token, target_id, service, state)
             payload = telegram_request(
                 bot_token,
                 "getUpdates",
@@ -5988,12 +6137,16 @@ def main() -> int:
                 if results:
                     offset = max(int(update.get("update_id", 0)) + 1 for update in results)
                 initialized = True
-                save_state({"offset": offset, "initialized": True})
+                state["offset"] = offset
+                state["initialized"] = True
+                save_state(state)
                 continue
             for update in payload.get("result", []):
                 update_id = int(update.get("update_id", 0))
                 offset = max(offset, update_id + 1)
-                save_state({"offset": offset, "initialized": True})
+                state["offset"] = offset
+                state["initialized"] = True
+                save_state(state)
 
                 message = update.get("message") or {}
                 chat = message.get("chat") or {}

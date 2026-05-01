@@ -132,6 +132,27 @@ class TransactionDraft:
             payload=payload,
         )
 
+    def sync_payload(self) -> None:
+        """Keep the bridge-ready payload aligned with edited draft fields."""
+        transactions = self.payload.get("transactions")
+        if not isinstance(transactions, list) or not transactions:
+            return
+        txn = transactions[0]
+        if not isinstance(txn, dict):
+            return
+        txn["type"] = self.type
+        txn["amount"] = self.amount
+        if self.date:
+            txn["date"] = self.date
+        txn["description"] = self.description
+        txn["source_name"] = self.source_name
+        txn["destination_name"] = self.destination_name
+        txn["category_name"] = self.category_name
+        txn["budget_name"] = self.budget_name
+        txn["notes"] = self.notes
+        txn["tags"] = self.tags
+        txn["currency_code"] = self.currency_code
+
 
 @dataclass
 class DraftSession:
@@ -315,6 +336,7 @@ class DraftManager:
         # Accept
         if lowered in {"sì", "si", "yes", "ok", "va bene", "giusto", "correct", "y"}:
             draft.category_confirmed = True
+            draft.sync_payload()
             return self._advance_after_category(session, ctx)
 
         # Reject → go to category selection
@@ -326,6 +348,7 @@ class DraftManager:
         if lowered in {"skip", "salta", "nessuna", "none"}:
             draft.category_name = None
             draft.category_confirmed = True
+            draft.sync_payload()
             return self._advance_after_category(session, ctx)
 
         # Direct name entry
@@ -336,6 +359,7 @@ class DraftManager:
             else:
                 draft.category_name = user_input_title_case(lowered)
             draft.category_confirmed = True
+            draft.sync_payload()
             return self._advance_after_category(session, ctx)
 
         return self.build_category_confirm_message(session)
@@ -389,6 +413,7 @@ class DraftManager:
         if lowered in {"skip", "salta", "nessuna", "none"}:
             draft.category_name = None
             draft.category_confirmed = True
+            draft.sync_payload()
             return self._advance_after_category(session, ctx)
 
         # Number selection
@@ -397,6 +422,7 @@ class DraftManager:
             if 0 <= index < len(categories):
                 draft.category_name = categories[index]
                 draft.category_confirmed = True
+                draft.sync_payload()
                 return self._advance_after_category(session, ctx)
 
         # Name entry
@@ -407,6 +433,7 @@ class DraftManager:
             else:
                 draft.category_name = user_input_title_case(lowered)
             draft.category_confirmed = True
+            draft.sync_payload()
             return self._advance_after_category(session, ctx)
 
         return self.build_category_select_message(session)
@@ -451,12 +478,14 @@ class DraftManager:
         # Skip
         if lowered in {"no", "n", "skip", "salta", "nessuno", "nope"}:
             draft.budget_confirmed = True
+            draft.sync_payload()
             return self._advance_after_budget(session, ctx)
 
         # Accept single suggestion
         if lowered in {"sì", "si", "yes", "ok", "y"} and len(suggestions) == 1:
             draft.budget_name = suggestions[0]
             draft.budget_confirmed = True
+            draft.sync_payload()
             return self._advance_after_budget(session, ctx)
 
         # Number selection
@@ -465,6 +494,7 @@ class DraftManager:
             if 0 <= index < len(suggestions):
                 draft.budget_name = suggestions[index]
                 draft.budget_confirmed = True
+                draft.sync_payload()
                 return self._advance_after_budget(session, ctx)
 
         # Name entry
@@ -475,6 +505,7 @@ class DraftManager:
             else:
                 draft.budget_name = user_input_title_case(lowered)
             draft.budget_confirmed = True
+            draft.sync_payload()
             return self._advance_after_budget(session, ctx)
 
         return self.build_budget_suggest_message(session)
@@ -588,9 +619,7 @@ class DraftManager:
         if amount_match:
             new_amount = amount_match.group(1).replace(",", ".")
             draft.amount = new_amount
-            if draft.payload:
-                for txn in draft.payload.get("transactions", []):
-                    txn["amount"] = new_amount
+            draft.sync_payload()
             return self.build_review_message(session)
 
         # Change description
@@ -602,9 +631,7 @@ class DraftManager:
             new_desc = desc_match.group(1).strip().rstrip(".,!?")
             if new_desc:
                 draft.description = new_desc
-                if draft.payload:
-                    for txn in draft.payload.get("transactions", []):
-                        txn["description"] = new_desc
+                draft.sync_payload()
                 return self.build_review_message(session)
 
         # Change category → back to category selection
@@ -623,9 +650,7 @@ class DraftManager:
             new_date = parse_flexible_date(date_match.group(1))
             if new_date:
                 draft.date = new_date.isoformat()
-                if draft.payload:
-                    for txn in draft.payload.get("transactions", []):
-                        txn["date"] = draft.date
+                draft.sync_payload()
                 return self.build_review_message(session)
 
         # Change source account
@@ -637,9 +662,7 @@ class DraftManager:
             new_source = source_match.group(1).strip().rstrip(".,!?")
             if new_source:
                 draft.source_name = new_source.title()
-                if draft.payload:
-                    for txn in draft.payload.get("transactions", []):
-                        txn["source_name"] = draft.source_name
+                draft.sync_payload()
                 return self.build_review_message(session)
 
         # Change destination account
@@ -651,9 +674,7 @@ class DraftManager:
             new_dest = dest_match.group(1).strip().rstrip(".,!?")
             if new_dest and new_dest not in {"X", "x"}:
                 draft.destination_name = new_dest.title()
-                if draft.payload:
-                    for txn in draft.payload.get("transactions", []):
-                        txn["destination_name"] = draft.destination_name
+                draft.sync_payload()
                 return self.build_review_message(session)
 
         # Request account list
@@ -708,13 +729,6 @@ class DraftManager:
         """Check if any draft has budget suggestions available."""
         for draft in session.drafts:
             if draft.budget_confirmed:
-                continue
-            try:
-                amount = float(draft.amount.replace(",", "."))
-            except (ValueError, AttributeError):
-                amount = 0.0
-            if amount < self.skip_budget_threshold:
-                draft.budget_confirmed = True
                 continue
             if self._budget_suggestions_for(draft):
                 return True

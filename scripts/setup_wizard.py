@@ -52,6 +52,10 @@ MANAGED_ENV_ORDER = [
     "TELEGRAM_ENABLED",
     "TELEGRAM_OWNER_ID",
     "TELEGRAM_TARGET_ID",
+    "TELEGRAM_STARTUP_HEALTHCHECK_ENABLED",
+    "TELEGRAM_LIVE_PING_ENABLED",
+    "TELEGRAM_LIVE_PING_TIME",
+    "TELEGRAM_SETUP_ACCOUNT_LIMIT",
     "PICOCLAW_TELEGRAM_CHANNEL_ENABLED",
     "FIREFLY_CHAT_LANGUAGE",
     "FIREFLY_RECEIPT_AI_OCR",
@@ -220,23 +224,15 @@ def seed_picoclaw_config(env_values: dict[str, str], telegram_token: str, firefl
     workspace.mkdir(parents=True, exist_ok=True)
 
     model_name = env_values["PICOCLAW_DEFAULT_MODEL_NAME"]
-    api_key_refs = {
-        "gemini": "ref:google_api_key",
-        "google": "ref:google_api_key",
-        "groq": "ref:groq_api_key",
-        "openai": "ref:openai_api_key",
-        "anthropic": "ref:anthropic_api_key",
-        "openrouter": "ref:openrouter_api_key",
-    }
     model_config = {
         "model_name": model_name,
         "model": env_values["PICOCLAW_DEFAULT_MODEL"],
-        "auth_method": "oauth" if model_name == "codex" else "api_key",
     }
-    if model_name in api_key_refs:
-        model_config["api_key"] = api_key_refs[model_name]
+    if model_name == "codex":
+        model_config["auth_method"] = "oauth"
 
     config = {
+        "version": 2,
         "agents": {
             "defaults": {
                 "workspace": str(workspace),
@@ -252,7 +248,6 @@ def seed_picoclaw_config(env_values: dict[str, str], telegram_token: str, firefl
         "channels": {
             "telegram": {
                 "enabled": env_values.get("PICOCLAW_TELEGRAM_CHANNEL_ENABLED", "false") == "true",
-                "token": "ref:telegram_bot_token",
                 "allow_from": [env_values["TELEGRAM_OWNER_ID"]],
                 "use_markdown_v2": False,
                 "streaming": {"enabled": True},
@@ -316,19 +311,27 @@ def seed_picoclaw_config(env_values: dict[str, str], telegram_token: str, firefl
     except OSError:
         pass
     security_yml = config_dir / ".security.yml"
+    model_key = ""
+    if model_name == "gemini" or model_name == "google":
+        model_key = env_values.get("GOOGLE_API_KEY", "")
+    elif model_name == "groq":
+        model_key = env_values.get("GROQ_API_KEY", "")
+    elif model_name == "openai":
+        model_key = env_values.get("OPENAI_API_KEY", "")
+    elif model_name == "anthropic":
+        model_key = env_values.get("ANTHROPIC_API_KEY", "")
+    elif model_name == "openrouter":
+        model_key = env_values.get("OPENROUTER_API_KEY", "")
+    security_payload = {
+        "model_list": {},
+        "channels": {"telegram": {"token": telegram_token}},
+    }
+    if model_key:
+        model_secret = {"api_keys": [model_key]}
+        security_payload["model_list"][model_name] = model_secret
+        security_payload["model_list"][f"{model_name}:0"] = model_secret
     security_yml.write_text(
-        yaml.safe_dump(
-            {
-                "telegram_bot_token": telegram_token,
-                "openai_api_key": env_values.get("OPENAI_API_KEY", ""),
-                "anthropic_api_key": env_values.get("ANTHROPIC_API_KEY", ""),
-                "openrouter_api_key": env_values.get("OPENROUTER_API_KEY", ""),
-                "groq_api_key": env_values.get("GROQ_API_KEY", ""),
-                "google_api_key": env_values.get("GOOGLE_API_KEY", ""),
-                "pdfapihub_api_key": env_values.get("PDFAPIHUB_API_KEY", ""),
-            },
-            sort_keys=False,
-        ),
+        yaml.safe_dump(security_payload, sort_keys=False),
         encoding="utf-8",
     )
     try:
@@ -416,6 +419,22 @@ def main(argv: list[str] | None = None) -> int:
                 allow_blank=True,
             )
         ) or telegram_owner_id
+    telegram_startup_healthcheck = prompt_bool(
+        "Send Telegram health check when the bot starts",
+        default=existing.get("TELEGRAM_STARTUP_HEALTHCHECK_ENABLED", "true").lower() != "false",
+    )
+    telegram_live_ping = prompt_bool(
+        "Send a daily Telegram live ping",
+        default=existing.get("TELEGRAM_LIVE_PING_ENABLED", "true").lower() != "false",
+    )
+    telegram_live_ping_time = prompt_text(
+        "Daily live ping time HH:MM",
+        default=existing.get("TELEGRAM_LIVE_PING_TIME", "09:00"),
+    )
+    telegram_setup_account_limit = prompt_text(
+        "Max accounts to show during training",
+        default=existing.get("TELEGRAM_SETUP_ACCOUNT_LIMIT", "50"),
+    )
     chat_language = prompt_choice(
         "Preferred chat language:",
         [("auto", "Auto-detect"), ("en", "English"), ("it", "Italiano")],
@@ -516,6 +535,10 @@ def main(argv: list[str] | None = None) -> int:
             "TELEGRAM_ENABLED": "true" if telegram_enabled else "false",
             "TELEGRAM_OWNER_ID": telegram_owner_id,
             "TELEGRAM_TARGET_ID": telegram_target_id,
+            "TELEGRAM_STARTUP_HEALTHCHECK_ENABLED": "true" if telegram_startup_healthcheck else "false",
+            "TELEGRAM_LIVE_PING_ENABLED": "true" if telegram_live_ping else "false",
+            "TELEGRAM_LIVE_PING_TIME": telegram_live_ping_time,
+            "TELEGRAM_SETUP_ACCOUNT_LIMIT": telegram_setup_account_limit,
             "PICOCLAW_TELEGRAM_CHANNEL_ENABLED": "false",
             "FIREFLY_CHAT_LANGUAGE": chat_language,
             "FIREFLY_RECEIPT_AI_OCR": env_values.get("FIREFLY_RECEIPT_AI_OCR", "true"),
