@@ -13,12 +13,18 @@ from scripts import telegram_firefly_bot as bot
 
 class _FakeClient:
     def list_accounts(self, kind: str = "all") -> list[dict[str, Any]]:
-        return [
+        accounts = [
             {"attributes": {"name": "Main Checking", "type": "asset"}},
             {"attributes": {"name": "Cash", "type": "asset"}},
             {"attributes": {"name": "Misc Expenses", "type": "expense"}},
             {"attributes": {"name": "Employer", "type": "revenue"}},
         ]
+        if kind and kind != "all":
+            return [item for item in accounts if item["attributes"]["type"] == kind]
+        return accounts
+
+    def health(self) -> dict[str, Any]:
+        return {"version": "test"}
 
 
 class _FakeService:
@@ -36,10 +42,18 @@ class TelegramSetupAndAutofillTest(unittest.TestCase):
         state: dict[str, Any] = {}
         first = bot.start_finance_setup(service, state, source_text="it")
         self.assertIn("Training", first.text)
+        self.assertIn("Da quale conto paghi", first.text)
+        self.assertIn("Main Checking", first.text)
+        self.assertNotIn("Misc Expenses", first.text)
+
+        second = bot.handle_finance_setup_message(service, state, "1")
+        self.assertIsNotNone(second)
+        self.assertIn("expense account", second.text)
+        self.assertIn("Misc Expenses", second.text)
+        self.assertNotIn("Main Checking", second.text)
 
         bot.handle_finance_setup_message(service, state, "1")
-        bot.handle_finance_setup_message(service, state, "3")
-        bot.handle_finance_setup_message(service, state, "4")
+        bot.handle_finance_setup_message(service, state, "1")
         bot.handle_finance_setup_message(service, state, "1")
         bot.handle_finance_setup_message(service, state, "1")
         bot.handle_finance_setup_message(service, state, "2")
@@ -55,6 +69,124 @@ class TelegramSetupAndAutofillTest(unittest.TestCase):
         self.assertEqual(profile["income_destination_account"], "Main Checking")
         self.assertEqual(profile["payment_method_accounts"]["card"], "Main Checking")
         self.assertEqual(profile["payment_method_accounts"]["cash"], "Cash")
+
+    def test_setup_shows_status_train_starts_wizard(self) -> None:
+        service = _FakeService()
+        state: dict[str, Any] = {}
+
+        setup = bot.process_message(service, "/setup", state)
+        self.assertIn("No complete finance profile", setup.text)
+        self.assertNotIn("Training 1/8", setup.text)
+
+        train = bot.process_message(service, "/train", state)
+        self.assertIn("Training 1/8", train.text)
+        self.assertIn("Main Checking", train.text)
+
+    def test_train_clears_maintenance_before_numeric_reply(self) -> None:
+        service = _FakeService()
+        state: dict[str, Any] = {"maintenance_mode": {"step": "account", "source_text": "/manutenzione"}}
+
+        train = bot.process_message(service, "/train", state)
+        self.assertIn("Training 1/8", train.text)
+        self.assertNotIn("maintenance_mode", state)
+
+        reply = bot.process_message(service, "1", state)
+        self.assertIn("Training 2/8", reply.text)
+        self.assertNotIn("Delete", reply.text)
+        self.assertNotIn("eliminare", reply.text.casefold())
+
+    def test_active_training_wins_over_stale_maintenance_state(self) -> None:
+        service = _FakeService()
+        state: dict[str, Any] = {
+            "maintenance_mode": {"step": "account", "source_text": "/manutenzione"},
+            "profile_setup": {"step_index": 0, "profile": {}},
+        }
+
+        reply = bot.process_message(service, "1", state)
+
+        self.assertIn("Training 2/8", reply.text)
+        self.assertNotIn("Delete", reply.text)
+
+    def test_training_account_list_uses_higher_limit(self) -> None:
+        class ManyAccountClient(_FakeClient):
+            def list_accounts(self, kind: str = "all") -> list[dict[str, Any]]:
+                accounts = [
+                    {"attributes": {"name": f"Card {index:02d}", "type": "asset"}}
+                    for index in range(1, 21)
+                ]
+                accounts.append({"attributes": {"name": "Misc Expenses", "type": "expense"}})
+                if kind and kind != "all":
+                    return [item for item in accounts if item["attributes"]["type"] == kind]
+                return accounts
+
+        class ManyAccountService:
+            client = ManyAccountClient()
+
+        state = {"profile_setup": {"step_index": 4, "profile": {}}}
+        prompt = bot.build_finance_setup_prompt(ManyAccountService(), state, source_text="en")
+
+        self.assertIn("Card 01", prompt)
+        self.assertIn("Card 20", prompt)
+
+    def test_training_keeps_real_account_named_accounts(self) -> None:
+        class AccountsClient(_FakeClient):
+            def list_accounts(self, kind: str = "all") -> list[dict[str, Any]]:
+                accounts = [
+                    {"attributes": {"name": "Accounts", "type": "expense"}},
+                    {"attributes": {"name": "Out", "type": "expense"}},
+                    {"attributes": {"name": "Accounts", "type": "asset"}},
+                    {"attributes": {"name": "Accounts USD", "type": "asset"}},
+                    {"attributes": {"name": "Cash", "type": "asset"}},
+                ]
+                if kind and kind != "all":
+                    return [item for item in accounts if item["attributes"]["type"] == kind]
+                return accounts
+
+        class AccountsService:
+            client = AccountsClient()
+
+        choices = bot.setup_account_choices_for_step(AccountsService(), "expense_source_account")
+
+        self.assertEqual(choices, ["Accounts", "Accounts USD", "Cash"])
+
+    def test_training_does_not_hide_duplicate_account_names(self) -> None:
+        class DuplicateAccountClient(_FakeClient):
+            def list_accounts(self, kind: str = "all") -> list[dict[str, Any]]:
+                accounts = [
+                    {"attributes": {"name": "Cash", "type": "asset"}},
+                    {"attributes": {"name": "Cash", "type": "asset"}},
+                    {"attributes": {"name": "Accounts", "type": "asset"}},
+                ]
+                if kind and kind != "all":
+                    return [item for item in accounts if item["attributes"]["type"] == kind]
+                return accounts
+
+        class DuplicateAccountService:
+            client = DuplicateAccountClient()
+
+        choices = bot.setup_account_choices_for_step(DuplicateAccountService(), "card_payment_account")
+
+        self.assertEqual(choices, ["Cash", "Cash", "Accounts"])
+
+    def test_health_prefix_falls_back_when_locale_key_missing(self) -> None:
+        original = bot.bot_text
+
+        def missing_key(*args: Any, **kwargs: Any) -> str:
+            raise KeyError("Missing string locale key: live_ping_ok")
+
+        try:
+            bot.bot_text = missing_key
+            text = bot.build_health_message(_FakeService(), source_text="en", prefix_key="live_ping_ok")
+        finally:
+            bot.bot_text = original
+
+        self.assertIn("Scheduled live check", text)
+        self.assertIn("Firefly bridge is healthy", text)
+
+    def test_health_message_handles_success(self) -> None:
+        text = bot.build_health_message(_FakeService(), source_text="en")
+        self.assertIn("Firefly bridge is healthy", text)
+        self.assertIn("test", text)
 
     def test_apply_profile_and_history_autofill_uses_profile_defaults(self) -> None:
         service = _FakeService()
@@ -77,6 +209,47 @@ class TelegramSetupAndAutofillTest(unittest.TestCase):
         )
         self.assertEqual(updated["source"], "Main Checking")
         self.assertEqual(updated["destination"], "Misc Expenses")
+
+    def test_budget_report_shows_left_and_limit_only_budgets(self) -> None:
+        text = bot.format_budget_report(
+            [{"type": "withdrawal", "budget_name": "Groceries", "amount": "40.00"}],
+            label="2026-04",
+            budget_limits={"Groceries": 100.0, "Travel": 50.0},
+            source_text="en",
+        )
+
+        self.assertIn("Groceries: spent 40.00 / limit 100.00 (left: 60.00)", text)
+        self.assertIn("Travel: spent 0.00 / limit 50.00 (left: 50.00)", text)
+
+    def test_created_transaction_result_shows_category_budget_and_mode(self) -> None:
+        payload = {
+            "transactions": [
+                {
+                    "type": "withdrawal",
+                    "amount": "0.90",
+                    "date": "2026-05-01",
+                    "description": "Caffe",
+                    "source_name": "Accounts",
+                    "destination_name": "Out",
+                    "category_name": "Bar",
+                    "budget_name": "Svago",
+                }
+            ]
+        }
+        text = bot.format_created_transaction_result({}, fallback_payload=payload, source_text="it")
+
+        self.assertIn("Categoria: Bar", text)
+        self.assertIn("Budget: Svago", text)
+        self.assertIn("Modalita: live", text)
+
+    def test_duplicate_blocked_rounds_amount(self) -> None:
+        text = bot.format_duplicate_blocked(
+            {"date": "2026-05-01", "amount": "0.900000000000", "description": "Caffe"},
+            source_text="it",
+        )
+
+        self.assertIn("EUR 0.90", text)
+        self.assertNotIn("0.900000000000", text)
 
     def test_payment_alias_and_description_cleanup(self) -> None:
         service = _FakeService()

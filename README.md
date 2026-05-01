@@ -61,6 +61,9 @@ docker compose --profile setup run --rm setup
   - `secrets/telegram_bot_token.txt`
 - Can validate connectivity and send a Telegram test message.
 - `--rm` removes the temporary setup container after completion.
+- Defaults to connecting to Firefly III through a normal URL or HTTPS domain.
+  The wizard keeps `FIREFLY_DOCKER_NETWORK_EXTERNAL=false` unless you explicitly
+  choose the advanced Docker-network mode.
 
 ### Step 3 - Start the companion stack
 
@@ -72,6 +75,42 @@ docker compose up -d --build
 - `--build`: builds the image if required (or if sources changed).
 - `-d`: runs the services in detached/background mode.
 - Starts the main `companion` service from `docker-compose.yml`.
+
+## Firefly connection and Docker networks
+
+The companion only talks to Firefly III through the REST API. It does not need
+database access or shared volumes.
+
+Recommended setup:
+
+```env
+FIREFLY_BASE_URL=https://firefly.example.com
+FIREFLY_DOCKER_NETWORK_EXTERNAL=false
+```
+
+Use this when Firefly III is reachable through a domain, HTTPS reverse proxy, or
+any URL the companion container can call. With `FIREFLY_DOCKER_NETWORK_EXTERNAL=false`,
+Docker Compose creates this app's own network automatically. This is the default
+and avoids startup failures on a fresh VPS.
+
+Advanced internal Docker setup:
+
+```env
+FIREFLY_DOCKER_NETWORK=<existing-firefly-network>
+FIREFLY_DOCKER_NETWORK_EXTERNAL=true
+FIREFLY_BASE_URL=http://<firefly-container-name>:8080
+```
+
+Use this only when Firefly III is already running in another Compose stack and
+you want direct container-to-container traffic. In this mode Compose expects the
+network to already exist and will fail with `network ... declared as external,
+but could not be found` if the name is wrong or the network has not been created.
+
+To find the network used by an existing Firefly container:
+
+```bash
+docker inspect -f '{{range $name, $_ := .NetworkSettings.Networks}}{{println $name}}{{end}}' firefly_iii_core
+```
 
 ### Step 4 - Verify startup and health
 

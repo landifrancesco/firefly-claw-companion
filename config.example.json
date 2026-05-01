@@ -1,4 +1,5 @@
 {
+  "version": 2,
   "agents": {
     "defaults": {
       "workspace": "/home/picoclaw/.picoclaw/workspace",
@@ -14,14 +15,12 @@
     {
       "model_name": "gemini",
       "model": "gemini/gemini-2.5-flash",
-      "auth_method": "api_key",
-      "api_key": "ref:google_api_key"
+      "enabled": true
     }
   ],
   "channels": {
     "telegram": {
       "enabled": false,
-      "token": "ref:telegram_bot_token",
       "allow_from": [],
       "use_markdown_v2": false,
       "streaming": { "enabled": true }

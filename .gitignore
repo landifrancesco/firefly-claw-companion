@@ -23,6 +23,7 @@ __pycache__/
 *.swo
 .mplconfig/
 .claude/
+.caliber/
 .tmp/
 .DS_Store
 Thumbs.db

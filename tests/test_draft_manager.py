@@ -123,6 +123,7 @@ class DraftManagerCategoryFlowTest(unittest.TestCase):
         response = manager.advance(session, "2")  # select "Spesa"
         self.assertEqual(session.drafts[0].category_name, "Spesa")
         self.assertTrue(session.drafts[0].category_confirmed)
+        self.assertEqual(session.drafts[0].payload["transactions"][0]["category_name"], "Spesa")
 
     def test_skip_category(self) -> None:
         manager = self._make_manager()
@@ -161,6 +162,7 @@ class DraftManagerBudgetFlowTest(unittest.TestCase):
         manager.advance(session, "sì")  # accept budget
         self.assertEqual(session.phase, DraftPhase.REVIEW)
         self.assertEqual(session.drafts[0].budget_name, "Svago")
+        self.assertEqual(session.drafts[0].payload["transactions"][0]["budget_name"], "Svago")
 
     def test_skip_budget(self) -> None:
         manager = self._make_manager()
@@ -170,13 +172,12 @@ class DraftManagerBudgetFlowTest(unittest.TestCase):
         self.assertEqual(session.phase, DraftPhase.REVIEW)
         self.assertIsNone(session.drafts[0].budget_name)
 
-    def test_low_amount_skips_budget(self) -> None:
+    def test_low_amount_still_suggests_budget_when_category_matches(self) -> None:
         manager = self._make_manager()
         payload = _make_payload(amount="2.00")
         session = manager.create_session([payload], language="it")
         manager.advance(session, "sì")  # confirm category
-        # Should skip budget because amount < threshold
-        self.assertEqual(session.phase, DraftPhase.REVIEW)
+        self.assertEqual(session.phase, DraftPhase.BUDGET_SUGGEST)
 
 
 class DraftManagerReviewTest(unittest.TestCase):

@@ -41,11 +41,22 @@ from firefly_companion.object_cache import FireflyObjectCache
 from firefly_companion.receipt_parser import count_visible_transactions
 
 
+def env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except ValueError:
+        return default
+
+
 STATE_PATH = Path(os.getenv("PICOCLAW_CONFIG_DIR", str(Path.home() / ".picoclaw"))) / "telegram-bot-state.json"
 POLL_TIMEOUT_SECONDS = 30
 ALLOWED_PRIVATE_CHAT_TYPES = {"private"}
 TELEGRAM_TEXT_LIMIT = 3900
 TELEGRAM_CAPTION_LIMIT = 1024
+SETUP_ACCOUNT_CHOICE_LIMIT = env_int("TELEGRAM_SETUP_ACCOUNT_LIMIT", 50)
+STARTUP_HEALTHCHECK_ENABLED = os.getenv("TELEGRAM_STARTUP_HEALTHCHECK_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+LIVE_PING_ENABLED = os.getenv("TELEGRAM_LIVE_PING_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+LIVE_PING_TIME = os.getenv("TELEGRAM_LIVE_PING_TIME", "09:00").strip()
 ITALIC_MARKER_PATTERN = re.compile(r"(?<!\w)_(?!\s)([^_\n]+?)(?<!\s)_(?!\w)")
 AUTOFILL_CACHE_SECONDS = 600
 PROFILE_SETUP_STEPS = (
@@ -433,6 +444,14 @@ def bot_text(key: str, *, source_text: str | None = None, **kwargs: Any) -> str:
     return conversation_module.bot_text(key, source_text=source_text, **kwargs)
 
 
+def bot_text_or_default(key: str, default_en: str, default_it: str, *, source_text: str | None = None, **kwargs: Any) -> str:
+    try:
+        return bot_text(key, source_text=source_text, **kwargs)
+    except KeyError:
+        value = localize(default_en, default_it, source_text=source_text)
+        return value.format(**kwargs) if kwargs else value
+
+
 def bot_list(key: str, *, source_text: str | None = None) -> list[str]:
     conversation_module.set_locale_dir(LOCALE_DIR)
     return conversation_module.bot_list(key, source_text=source_text)
@@ -549,9 +568,9 @@ COMMAND_ALIASES: dict[str, str] = {
     "/recenti":      "/recent",
     "/principali":   "/topcategories",
     "/reportbudget": "/budgetreport",
+    "/impostabudget": "/setbudgetlimit",
     "/manutenzione": "/maintenance",
     "/cerca":        "/search",
-    "/grafico":      "/graph",
     "/salute":       "/health",
     "/esporta":      "/backup",
     "/backupdata":   "/backup",
@@ -564,6 +583,12 @@ COMMAND_ALIASES: dict[str, str] = {
     "/budget":       "/budgets",
     "/ricorrenze":   "/recurrences",
     "/grafico":      "/graph",
+    "/spesa":        "/expense",
+    "/entrata":      "/income",
+    "/trasferimento": "/transfer",
+    "/nuovacategoria": "/newcategory",
+    "/nuovobudget":  "/newbudget",
+    "/nuovoconto":   "/newaccount",
     "/stop":         "/cancel",
 }
 
@@ -572,10 +597,11 @@ def ensure_telegram_commands(bot_token: str) -> None:
     commands_en = [
         {"command": "help", "description": "Help and examples"},
         {"command": "commands", "description": "Full command list"},
-        {"command": "train", "description": "Teach account aliases and defaults"},
-        {"command": "setup", "description": "Setup account/budget profile"},
+        {"command": "setup", "description": "Show or reset finance profile"},
+        {"command": "train", "description": "Teach account defaults and aliases"},
         {"command": "add", "description": "Interactive transaction add"},
         {"command": "balances", "description": "Show balances"},
+        {"command": "health", "description": "Health check"},
         {"command": "summary", "description": "Monthly/custom summary"},
         {"command": "recent", "description": "Recent transactions"},
         {"command": "search", "description": "Search transactions by keyword"},
@@ -585,19 +611,21 @@ def ensure_telegram_commands(bot_token: str) -> None:
         {"command": "maintenance", "description": "Cleanup mode"},
     ]
     commands_it = [
-        {"command": "help", "description": "Aiuto ed esempi"},
-        {"command": "commands", "description": "Lista comandi completa"},
-        {"command": "train", "description": "Insegna alias conti e default"},
-        {"command": "setup", "description": "Configura profilo conti/budget"},
-        {"command": "add", "description": "Aggiunta transazione guidata"},
-        {"command": "balances", "description": "Mostra saldi"},
-        {"command": "summary", "description": "Riepilogo mese/intervallo"},
-        {"command": "recent", "description": "Transazioni recenti"},
-        {"command": "search", "description": "Cerca transazioni per parola chiave"},
-        {"command": "topcategories", "description": "Categorie principali per spesa"},
-        {"command": "budgetreport", "description": "Report budget"},
-        {"command": "backup", "description": "Invia backup JSON"},
-        {"command": "maintenance", "description": "Modalita manutenzione"},
+        {"command": "aiuto", "description": "Aiuto ed esempi"},
+        {"command": "comandi", "description": "Lista comandi completa"},
+        {"command": "configura", "description": "Mostra o resetta il profilo"},
+        {"command": "impara", "description": "Insegna conti e alias"},
+        {"command": "aggiungi", "description": "Aggiunta transazione guidata"},
+        {"command": "saldi", "description": "Mostra saldi"},
+        {"command": "salute", "description": "Controllo stato"},
+        {"command": "riepilogo", "description": "Riepilogo mese o intervallo"},
+        {"command": "recenti", "description": "Transazioni recenti"},
+        {"command": "cerca", "description": "Cerca transazioni per parola chiave"},
+        {"command": "principali", "description": "Categorie principali per spesa"},
+        {"command": "reportbudget", "description": "Report budget"},
+        {"command": "grafico", "description": "Grafici saldi, spese o flusso"},
+        {"command": "esporta", "description": "Invia backup JSON"},
+        {"command": "manutenzione", "description": "Modalita manutenzione"},
     ]
     telegram_request(
         bot_token,
@@ -615,6 +643,15 @@ def ensure_telegram_commands(bot_token: str) -> None:
             "commands": json.dumps(commands_it, ensure_ascii=False),
             "scope": json.dumps({"type": "all_private_chats"}),
             "language_code": "it",
+        },
+    )
+    default_commands = commands_it if configured_chat_language() == "it" else commands_en
+    telegram_request(
+        bot_token,
+        "setMyCommands",
+        data={
+            "commands": json.dumps(default_commands, ensure_ascii=False),
+            "scope": json.dumps({"type": "all_private_chats"}),
         },
     )
 
@@ -887,11 +924,42 @@ def format_transaction_batch_preview(
 def format_duplicate_blocked(duplicate: dict[str, Any], *, source_text: str | None = None) -> str:
     return localize(
         "Blocked as a likely duplicate.\n"
-        f"{format_display_date(str(duplicate.get('date', ''))[:10])} | {duplicate.get('amount')} | {duplicate.get('description')}",
+        f"{format_display_date(str(duplicate.get('date', ''))[:10])} | {format_money(duplicate.get('amount'))} | {duplicate.get('description')}",
         "Bloccata come possibile duplicato.\n"
-        f"{format_display_date(str(duplicate.get('date', ''))[:10])} | {duplicate.get('amount')} | {duplicate.get('description')}",
+        f"{format_display_date(str(duplicate.get('date', ''))[:10])} | {format_money(duplicate.get('amount'))} | {duplicate.get('description')}",
         source_text=source_text,
     )
+
+
+def _first_payload_transaction(payload: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        return {}
+    transactions = payload.get("transactions")
+    if isinstance(transactions, list) and transactions and isinstance(transactions[0], dict):
+        return transactions[0]
+    return {}
+
+
+def _merged_created_transaction(result: dict[str, Any], fallback_payload: dict[str, Any] | None) -> dict[str, Any]:
+    fallback_tx = _first_payload_transaction(fallback_payload)
+    data = result.get("data")
+    if isinstance(data, dict):
+        attributes = data.get("attributes", {})
+        transactions = attributes.get("transactions", [])
+        if isinstance(transactions, list) and transactions and isinstance(transactions[0], dict):
+            tx = dict(fallback_tx)
+            tx.update({key: value for key, value in transactions[0].items() if value not in (None, "")})
+            if not tx.get("description") and attributes.get("group_title"):
+                tx["description"] = attributes.get("group_title")
+            return tx
+    return dict(fallback_tx)
+
+
+def _field_or_missing(value: Any, *, source_text: str | None = None) -> str:
+    text = str(value or "").strip()
+    if text:
+        return text
+    return localize("not set", "non impostato", source_text=source_text)
 
 
 def format_created_transaction_result(
@@ -905,34 +973,22 @@ def format_created_transaction_result(
         "Transazione creata con successo.",
         source_text=source_text,
     )
-    data = result.get("data")
-    if isinstance(data, dict):
-        attributes = data.get("attributes", {})
-        transactions = attributes.get("transactions", [])
-        if transactions:
-            tx = transactions[0]
-            date_value = format_display_date(str(tx.get("date", ""))[:10])
-            type_label = localized_transaction_type(tx.get("type", "transaction"), source_text=source_text)
-            amount_label = format_money(tx.get("amount"))
-            headline = localize(
-                f"{type_label} {amount_label} on {date_value}",
-                f"{type_label} {amount_label} del {date_value}",
-                source_text=source_text,
-            )
-            return (
-                f"{success_title}\n"
-                f"{headline}\n"
-                f"{tx.get('description') or attributes.get('group_title') or 'No description'}\n"
-                f"{tx.get('source_name', '-') or '-'} -> {tx.get('destination_name', '-') or '-'}"
-            )
-
-    if fallback_payload:
-        return format_transaction_preview(
-            fallback_payload,
-            intro=success_title,
-            outro="",
-            source_text=source_text,
-        ).rstrip()
+    tx = _merged_created_transaction(result, fallback_payload)
+    if tx:
+        lines = [
+            success_title,
+            "",
+            f"{localize('Type', 'Tipo', source_text=source_text)}: {localized_transaction_type(tx.get('type', 'transaction'), source_text=source_text)}",
+            f"{localize('Amount', 'Importo', source_text=source_text)}: {format_money(tx.get('amount'))}",
+            f"{localize('Date', 'Data', source_text=source_text)}: {format_display_date(str(tx.get('date', ''))[:10])}",
+            f"{localize('Description', 'Descrizione', source_text=source_text)}: {_field_or_missing(tx.get('description'), source_text=source_text)}",
+            f"{localize('From', 'Da', source_text=source_text)}: {_field_or_missing(tx.get('source_name'), source_text=source_text)}",
+            f"{localize('To', 'A', source_text=source_text)}: {_field_or_missing(tx.get('destination_name'), source_text=source_text)}",
+            f"{localize('Category', 'Categoria', source_text=source_text)}: {_field_or_missing(tx.get('category_name'), source_text=source_text)}",
+            f"Budget: {_field_or_missing(tx.get('budget_name'), source_text=source_text)}",
+            f"{localize('Mode', 'Modalita', source_text=source_text)}: live",
+        ]
+        return "\n".join(lines)
 
     return success_title
 
@@ -1004,19 +1060,65 @@ def match_choice(value: str, choices: list[str]) -> str | None:
     return None
 
 
-def account_choice_list(service: BridgeService, *, limit: int = 12) -> list[str]:
-    cache = FireflyObjectCache(service.client)
-    names = cache.accounts()
-    if names:
-        return names[:limit]
-    return summarize_name_list(service.client.list_accounts("all"), limit=limit)
+def unique_usable_names(names: list[str], *, limit: int) -> list[str]:
+    result: list[str] = []
+    for name in names:
+        clean = usable_account_name(name)
+        if not clean:
+            continue
+        result.append(clean)
+        if len(result) >= limit:
+            break
+    return result
+
+
+def account_choice_list(service: BridgeService, *, account_type: str = "all", limit: int = SETUP_ACCOUNT_CHOICE_LIMIT) -> list[str]:
+    if account_type == "all":
+        cache = FireflyObjectCache(service.client)
+        names = cache.accounts() or summarize_name_list(service.client.list_accounts("all"), limit=limit * 2)
+        return unique_usable_names(names, limit=limit)
+
+    try:
+        names = summarize_name_list(service.client.list_accounts(account_type), limit=limit * 2)
+    except Exception:
+        names = []
+    typed_names = unique_usable_names(names, limit=limit)
+    if typed_names:
+        return typed_names
+    return account_choice_list(service, account_type="all", limit=limit)
+
+
+def setup_account_choices_for_step(service: BridgeService, step: str, *, limit: int = SETUP_ACCOUNT_CHOICE_LIMIT) -> list[str]:
+    account_type_by_step = {
+        "expense_source_account": "asset",
+        "expense_destination_account": "expense",
+        "income_source_account": "revenue",
+        "income_destination_account": "asset",
+        "card_payment_account": "asset",
+        "cash_payment_account": "asset",
+    }
+    return account_choice_list(service, account_type=account_type_by_step.get(step, "all"), limit=limit)
+
+
+def add_flow_account_choices(service: BridgeService, params: dict[str, Any], step: str, *, limit: int = 12) -> list[str]:
+    intent = str(params.get("intent") or "").strip()
+    return intent_account_choices(service, intent, step, limit=limit)
+
+
+def intent_account_choices(service: BridgeService, intent: str, field: str, *, limit: int = 12) -> list[str]:
+    if intent == "create_expense":
+        account_type = "asset" if field == "source" else "expense"
+    elif intent == "create_income":
+        account_type = "revenue" if field == "source" else "asset"
+    elif intent == "create_transfer":
+        account_type = "asset"
+    else:
+        account_type = "all"
+    return account_choice_list(service, account_type=account_type, limit=limit)
 
 
 def usable_account_name(value: Any) -> str:
-    name = str(value or "").strip()
-    if normalize_natural_text(name) in {"account", "accounts", "conto", "conti"}:
-        return ""
-    return name
+    return str(value or "").strip()
 
 
 def parse_yes_no(value: str) -> bool | None:
@@ -1057,10 +1159,10 @@ def finance_profile_summary(state: dict[str, Any], *, source_text: str | None = 
     profile = get_finance_profile(state)
     lines = [localize("Finance profile:", "Profilo finanziario:", source_text=source_text)]
     for key, label_en, label_it in (
-        ("expense_source_account", "Default expense source", "Conto sorgente spese"),
-        ("expense_destination_account", "Default expense destination", "Conto destinazione spese"),
-        ("income_source_account", "Default income source", "Conto sorgente entrate"),
-        ("income_destination_account", "Default income destination", "Conto destinazione entrate"),
+        ("expense_source_account", "Expenses paid from", "Spese pagate da"),
+        ("expense_destination_account", "Expenses recorded to", "Spese registrate verso"),
+        ("income_source_account", "Income comes from", "Entrate provenienti da"),
+        ("income_destination_account", "Income deposited into", "Entrate depositate su"),
     ):
         value = str(profile.get(key) or "-").strip() or "-"
         lines.append(f"- {localize(label_en, label_it, source_text=source_text)}: {value}")
@@ -1085,11 +1187,28 @@ def finance_profile_summary(state: dict[str, Any], *, source_text: str | None = 
 
 
 def start_finance_setup(service: BridgeService, state: dict[str, Any], *, source_text: str | None = None) -> BotResponse:
+    state.pop("add_flow", None)
+    state.pop("maintenance_mode", None)
+    state.pop("pending_transaction_resolution", None)
     state["profile_setup"] = {
         "step_index": 0,
         "profile": get_finance_profile(state),
     }
     return BotResponse(build_finance_setup_prompt(service, state, source_text=source_text))
+
+
+def setup_overview_text(state: dict[str, Any], *, source_text: str | None = None) -> str:
+    intro = localize(
+        "Current setup is active." if finance_profile_ready(state) else "No complete finance profile yet.",
+        "La configurazione attuale e attiva." if finance_profile_ready(state) else "Non c'e ancora un profilo finanziario completo.",
+        source_text=source_text,
+    )
+    hint = localize(
+        "Use /train to teach accounts and aliases. Use /setup reset to clear the profile.",
+        "Usa /impara per insegnare conti e alias. Usa /configura reset per cancellare il profilo.",
+        source_text=source_text,
+    )
+    return f"{intro}\n\n{finance_profile_summary(state, source_text=source_text)}\n\n{hint}"
 
 
 def build_finance_setup_prompt(service: BridgeService, state: dict[str, Any], *, source_text: str | None = None) -> str:
@@ -1099,7 +1218,7 @@ def build_finance_setup_prompt(service: BridgeService, state: dict[str, Any], *,
     step_index = int(setup.get("step_index") or 0)
     step_index = max(0, min(step_index, len(PROFILE_SETUP_STEPS) - 1))
     step = PROFILE_SETUP_STEPS[step_index]
-    account_options = account_choice_list(service)
+    account_options = setup_account_choices_for_step(service, step)
 
     if step in {
         "expense_source_account",
@@ -1111,23 +1230,23 @@ def build_finance_setup_prompt(service: BridgeService, state: dict[str, Any], *,
     }:
         prompt_map = {
             "expense_source_account": localize(
-                "Training 1/8. Which account should I use when money goes out by default?",
-                "Training 1/8. Quale conto devo usare di default quando i soldi escono?",
+                "Training 1/8. Which account usually pays expenses?",
+                "Training 1/8. Da quale conto paghi di solito le spese?",
                 source_text=source_text,
             ),
             "expense_destination_account": localize(
-                "Training 2/8. Which destination account should I use for expenses (merchant side)?",
-                "Training 2/8. Quale conto destinazione devo usare per le spese (controparte/esercente)?",
+                "Training 2/8. Which Firefly expense account should receive expenses?",
+                "Training 2/8. In quale conto spese di Firefly devo registrare le uscite?",
                 source_text=source_text,
             ),
             "income_source_account": localize(
-                "Training 3/8. Optional: default source account for incomes. Reply 'skip' to leave empty.",
-                "Training 3/8. Opzionale: conto sorgente predefinito per entrate. Rispondi 'skip' per lasciare vuoto.",
+                "Training 3/8. Optional: who usually sends income? Reply 'skip' to leave empty.",
+                "Training 3/8. Opzionale: da chi arrivano di solito le entrate? Rispondi 'skip' per lasciare vuoto.",
                 source_text=source_text,
             ),
             "income_destination_account": localize(
-                "Training 4/8. Which account receives income by default?",
-                "Training 4/8. Quale conto riceve le entrate di default?",
+                "Training 4/8. Which account receives income?",
+                "Training 4/8. Su quale conto arrivano le entrate?",
                 source_text=source_text,
             ),
             "card_payment_account": localize(
@@ -1143,28 +1262,36 @@ def build_finance_setup_prompt(service: BridgeService, state: dict[str, Any], *,
         }
         lines = [prompt_map[step]]
         if account_options:
-            lines.append(localize("Available accounts:", "Conti disponibili:", source_text=source_text))
+            list_labels = {
+                "expense_source_account": localize("Asset accounts to choose from:", "Conti/carte da cui paghi:", source_text=source_text),
+                "expense_destination_account": localize("Expense accounts to choose from:", "Conti spese in Firefly:", source_text=source_text),
+                "income_source_account": localize("Revenue accounts to choose from:", "Conti entrata in Firefly:", source_text=source_text),
+                "income_destination_account": localize("Asset accounts to choose from:", "Conti che ricevono denaro:", source_text=source_text),
+                "card_payment_account": localize("Asset accounts to choose from:", "Conti/carte disponibili:", source_text=source_text),
+                "cash_payment_account": localize("Asset accounts to choose from:", "Conti/casse disponibili:", source_text=source_text),
+            }
+            lines.append(list_labels.get(step, localize("Available accounts:", "Conti disponibili:", source_text=source_text)))
             for index, name in enumerate(account_options, start=1):
                 lines.append(f"{index}. {name}")
         examples = {
             "expense_source_account": localize(
-                "Example: 'add expense 4.50 coffee paid by debit card' -> source is usually your card/checking account.",
-                "Esempio: 'aggiungi spesa 4,50 caffe pagata con carta' -> la sorgente e di solito il conto/carta da cui escono i soldi.",
+                "Example: for 'coffee paid by card', choose the card/checking/cash account. Do not choose the generic expense account here.",
+                "Esempio: per 'caffe pagato con carta', scegli carta/conto/cassa. Non scegliere qui il conto spese generico.",
                 source_text=source_text,
             ),
             "expense_destination_account": localize(
-                "Example: same transaction -> destination is usually your generic expense/merchant side account.",
-                "Esempio: stessa transazione -> la destinazione e di solito il conto controparte spese/esercente.",
+                "Example: for the same coffee, this is the merchant/expense side, often named Expenses, Out, or a shop account. This is not the card.",
+                "Esempio: per lo stesso caffe, questo e il lato esercente/spesa, spesso chiamato Spese, Out o negozio. Non e la carta.",
                 source_text=source_text,
             ),
             "income_source_account": localize(
-                "Example: 'salary 2500' -> optional source could be Employer.",
-                "Esempio: 'stipendio 2500' -> la sorgente opzionale puo essere Datore di lavoro.",
+                "Example: for 'salary 2500', this can be Employer or Salary. You can skip it if you do not use revenue accounts.",
+                "Esempio: per 'stipendio 2500', puo essere Datore di lavoro o Stipendio. Puoi saltare se non usi conti entrata.",
                 source_text=source_text,
             ),
             "income_destination_account": localize(
-                "Example: salary/incoming transfer lands on this account.",
-                "Esempio: stipendio/bonifico in entrata arriva su questo conto.",
+                "Example: salary lands in your checking account, card account, or cash account.",
+                "Esempio: lo stipendio arriva sul conto corrente, carta o cassa.",
                 source_text=source_text,
             ),
             "card_payment_account": localize(
@@ -1214,7 +1341,7 @@ def handle_finance_setup_message(service: BridgeService, state: dict[str, Any], 
 
     step = PROFILE_SETUP_STEPS[step_index]
     profile = dict(setup.get("profile") or get_finance_profile(state))
-    account_options = account_choice_list(service)
+    account_options = setup_account_choices_for_step(service, step)
     answer = text.strip()
 
     if step in {
@@ -1398,7 +1525,9 @@ def queue_transaction_field_resolution(
     fields: list[str],
     source_text: str | None = None,
 ) -> BotResponse:
-    options = account_choice_list(service, limit=15)
+    intent = str(payload.get("intent") or "").strip()
+    first_field = fields[0] if fields else "source"
+    options = intent_account_choices(service, intent, first_field, limit=15)
     state["pending_transaction_resolution"] = {
         "payload": payload,
         "fields": fields,
@@ -1417,8 +1546,23 @@ def build_transaction_resolution_prompt(state: dict[str, Any]) -> str:
     if not fields:
         return "No unresolved fields."
     field = fields[0]
-    field_label = "source account" if field == "source" else "destination account"
-    lines = [f"I need the {field_label} before I can prepare the draft safely."]
+    payload = pending.get("payload") if isinstance(pending.get("payload"), dict) else {}
+    intent = str(payload.get("intent") or "")
+    if intent == "create_expense" and field == "source":
+        lines = ["I need the account that paid for the expense. Choose your card/checking/cash account."]
+    elif intent == "create_expense" and field == "destination":
+        lines = ["I need the Firefly expense-side account. This is usually Expenses, Out, or a merchant account, not your card."]
+    elif intent == "create_income" and field == "source":
+        lines = ["I need who sent the money. Choose a revenue account, or reply skip if you do not use one."]
+    elif intent == "create_income" and field == "destination":
+        lines = ["I need the account that received the money."]
+    elif intent == "create_transfer" and field == "source":
+        lines = ["I need the account to transfer from."]
+    elif intent == "create_transfer" and field == "destination":
+        lines = ["I need the account to transfer to."]
+    else:
+        field_label = "source account" if field == "source" else "destination account"
+        lines = [f"I need the {field_label} before I can prepare the draft safely."]
     if options:
         lines.append("Available accounts:")
         for index, name in enumerate(options, start=1):
@@ -1463,6 +1607,7 @@ def handle_pending_transaction_resolution(service: BridgeService, state: dict[st
     if fields:
         pending["payload"] = payload
         pending["fields"] = fields
+        pending["options"] = intent_account_choices(service, str(payload.get("intent") or ""), fields[0], limit=15)
         state["pending_transaction_resolution"] = pending
         return BotResponse(build_transaction_resolution_prompt(state))
 
@@ -1487,7 +1632,8 @@ def build_add_flow_prompt(service: BridgeService, state: dict[str, Any], *, sour
     if not isinstance(flow, dict):
         return localize("No active add flow.", "Nessun flusso /add attivo.", source_text=source_text)
     step = str(flow.get("step") or "kind")
-    account_options = account_choice_list(service, limit=10)
+    params = dict(flow.get("params") or {})
+    account_options = add_flow_account_choices(service, params, step, limit=10)
     cache = FireflyObjectCache(service.client)
     category_options = cache.categories()[:8]
     budget_options = cache.budgets()[:8]
@@ -1517,16 +1663,52 @@ def build_add_flow_prompt(service: BridgeService, state: dict[str, Any], *, sour
             source_text=source_text,
         )
     if step == "source":
-        lines = [localize("Add step 5/8. Source account? (or 'auto'/'skip')", "Add step 5/8. Conto sorgente? (oppure 'auto'/'skip')", source_text=source_text)]
+        intent = str(params.get("intent") or "")
+        source_prompt = {
+            "create_expense": localize(
+                "Add step 5/8. Which account paid? Choose your card/checking/cash account, or 'auto'.",
+                "Add step 5/8. Da quale conto hai pagato? Scegli carta/conto/cassa, oppure 'auto'.",
+                source_text=source_text,
+            ),
+            "create_income": localize(
+                "Add step 5/8. Who sent the money? Choose a revenue account, or 'auto'/'skip'.",
+                "Add step 5/8. Da chi arrivano i soldi? Scegli un conto entrata, oppure 'auto'/'skip'.",
+                source_text=source_text,
+            ),
+            "create_transfer": localize(
+                "Add step 5/8. Transfer from which account?",
+                "Add step 5/8. Trasferimento da quale conto?",
+                source_text=source_text,
+            ),
+        }
+        lines = [source_prompt.get(intent, localize("Add step 5/8. Source account? (or 'auto'/'skip')", "Add step 5/8. Conto sorgente? (oppure 'auto'/'skip')", source_text=source_text))]
         if account_options:
-            lines.append(localize("Accounts:", "Conti:", source_text=source_text))
+            lines.append(localize("Available choices:", "Scelte disponibili:", source_text=source_text))
             for i, name in enumerate(account_options, start=1):
                 lines.append(f"{i}. {name}")
         return "\n".join(lines)
     if step == "destination":
-        lines = [localize("Add step 6/8. Destination account? (or 'auto'/'skip')", "Add step 6/8. Conto destinazione? (oppure 'auto'/'skip')", source_text=source_text)]
+        intent = str(params.get("intent") or "")
+        destination_prompt = {
+            "create_expense": localize(
+                "Add step 6/8. Where should Firefly record the expense side? Usually Expenses/Out/merchant, or 'auto'.",
+                "Add step 6/8. Dove registro il lato spesa in Firefly? Di solito Spese/Out/esercente, oppure 'auto'.",
+                source_text=source_text,
+            ),
+            "create_income": localize(
+                "Add step 6/8. Which account received the money?",
+                "Add step 6/8. Su quale conto sono arrivati i soldi?",
+                source_text=source_text,
+            ),
+            "create_transfer": localize(
+                "Add step 6/8. Transfer to which account?",
+                "Add step 6/8. Trasferimento verso quale conto?",
+                source_text=source_text,
+            ),
+        }
+        lines = [destination_prompt.get(intent, localize("Add step 6/8. Destination account? (or 'auto'/'skip')", "Add step 6/8. Conto destinazione? (oppure 'auto'/'skip')", source_text=source_text))]
         if account_options:
-            lines.append(localize("Accounts:", "Conti:", source_text=source_text))
+            lines.append(localize("Available choices:", "Scelte disponibili:", source_text=source_text))
             for i, name in enumerate(account_options, start=1):
                 lines.append(f"{i}. {name}")
         return "\n".join(lines)
@@ -1610,12 +1792,12 @@ def handle_add_flow_message(service: BridgeService, state: dict[str, Any], text:
         flow["step"] = "source"
     elif step == "source":
         if not _flow_skip(answer):
-            resolved = match_choice(answer, account_choice_list(service, limit=50))
+            resolved = match_choice(answer, add_flow_account_choices(service, params, "source", limit=50))
             params["source"] = resolved or answer
         flow["step"] = "destination"
     elif step == "destination":
         if not _flow_skip(answer):
-            resolved = match_choice(answer, account_choice_list(service, limit=50))
+            resolved = match_choice(answer, add_flow_account_choices(service, params, "destination", limit=50))
             params["destination"] = resolved or answer
         flow["step"] = "category"
     elif step == "category":
@@ -2444,7 +2626,8 @@ def format_budget_report(
     source_text: str | None = None,
 ) -> str:
     totals = aggregate_spending_by_budget(records)
-    if not totals:
+    limits = budget_limits or {}
+    if not totals and not limits:
         return localize(
             f"No budget-linked spending found for {label}.",
             f"Nessuna spesa collegata a budget trovata per {label}.",
@@ -2452,16 +2635,48 @@ def format_budget_report(
         )
 
     lines = [localize(f"Budget report for {label}:", f"Report budget per {label}:", source_text=source_text)]
-    for name, spent in list(totals.items())[:12]:
-        limit = (budget_limits or {}).get(name)
+    names = list(totals.keys())
+    for name in sorted(limits):
+        if name not in totals:
+            names.append(name)
+    for name in names[:12]:
+        spent = totals.get(name, 0.0)
+        limit = limits.get(name)
+        spent_label = localize("spent", "spesi", source_text=source_text)
+        limit_label = localize("limit", "limite", source_text=source_text)
         if limit and limit > 0:
             remaining = limit - spent
-            sign = "+" if remaining >= 0 else ""
-            remaining_label = localize("remaining", "rimanente", source_text=source_text)
-            lines.append(f"- {name}: {spent:.2f} / {limit:.2f} ({remaining_label}: {sign}{remaining:.2f})")
+            if remaining >= 0:
+                remaining_label = localize("left", "rimasti", source_text=source_text)
+                lines.append(f"- {name}: {spent_label} {spent:.2f} / {limit_label} {limit:.2f} ({remaining_label}: {remaining:.2f})")
+            else:
+                over_label = localize("over limit", "oltre limite", source_text=source_text)
+                lines.append(f"- {name}: {spent_label} {spent:.2f} / {limit_label} {limit:.2f} ({over_label}: {abs(remaining):.2f})")
         else:
-            lines.append(f"- {name}: {spent:.2f}")
+            no_limit = localize("no limit", "senza limite", source_text=source_text)
+            lines.append(f"- {name}: {spent_label} {spent:.2f} ({no_limit})")
     return "\n".join(lines)
+
+
+def collect_budget_limits(service: BridgeService, start: date, end: date) -> dict[str, float]:
+    budget_limits: dict[str, float] = {}
+    for budget in service.client.list_budgets():
+        b_id = str(budget.get("id") or "").strip()
+        b_name = str((budget.get("attributes") or {}).get("name") or "").strip()
+        if not b_id or not b_name:
+            continue
+        total_limit = 0.0
+        for item in service.client.list_budget_limits(b_id, start=start.isoformat(), end=end.isoformat()):
+            raw = (item.get("attributes") or {}).get("amount") or 0
+            try:
+                amount = float(raw)
+            except (ValueError, TypeError):
+                amount = 0.0
+            if amount > 0:
+                total_limit += amount
+        if total_limit > 0:
+            budget_limits[b_name] = total_limit
+    return budget_limits
 
 
 def format_recurrences(items: list[dict[str, Any]], *, source_text: str | None = None) -> str:
@@ -4386,20 +4601,7 @@ def execute_intent(service: BridgeService, payload: dict[str, Any], state: dict[
         records = flatten_transactions(service.client.list_transactions(start=start, end=end, limit=300))
         budget_limits: dict[str, float] = {}
         try:
-            for budget in service.client.list_budgets():
-                b_id = str(budget.get("id") or "").strip()
-                b_name = str((budget.get("attributes") or {}).get("name") or "").strip()
-                if not b_id or not b_name:
-                    continue
-                limits = service.client.list_budget_limits(b_id, start=start.isoformat(), end=end.isoformat())
-                if limits:
-                    raw = (limits[0].get("attributes") or {}).get("amount") or 0
-                    try:
-                        amount = float(raw)
-                    except (ValueError, TypeError):
-                        amount = 0.0
-                    if amount > 0:
-                        budget_limits[b_name] = amount
+            budget_limits = collect_budget_limits(service, start, end)
         except Exception:
             pass
         return BotResponse(format_budget_report(records, label=label, budget_limits=budget_limits, source_text=source_text))
@@ -5180,13 +5382,13 @@ def process_message(service: BridgeService, text: str, state: dict[str, Any]) ->
     if add_response is not None:
         return add_response
 
-    maintenance_response = handle_maintenance_message(service, state, text)
-    if maintenance_response is not None:
-        return maintenance_response
-
     setup_response = handle_finance_setup_message(service, state, text)
     if setup_response is not None:
         return setup_response
+
+    maintenance_response = handle_maintenance_message(service, state, text)
+    if maintenance_response is not None:
+        return maintenance_response
 
     resolution_response = handle_pending_transaction_resolution(service, state, text)
     if resolution_response is not None:
@@ -5370,22 +5572,31 @@ def process_message(service: BridgeService, text: str, state: dict[str, Any]) ->
         start_maintenance_mode(state, source_text=text)
         return BotResponse(maintenance_menu_text(source_text=text))
 
-    if command in {"/setup", "/train"}:
+    if command == "/setup":
+        state.pop("maintenance_mode", None)
+        state.pop("add_flow", None)
         action = normalize_natural_text(tail)
         if action == "status":
-            return BotResponse(finance_profile_summary(state, source_text=text))
+            return BotResponse(setup_overview_text(state, source_text=text))
         if action in {"reset", "restart"}:
             state.pop("finance_profile", None)
             state.pop("profile_setup", None)
+            return BotResponse(
+                localize(
+                    "Finance profile reset. Use /train to teach accounts again.",
+                    "Profilo finanziario cancellato. Usa /impara per insegnare di nuovo i conti.",
+                    source_text=text,
+                )
+            )
+        if action in {"start", "train", "impara", "allena"}:
             return start_finance_setup(service, state, source_text=text)
-        if command == "/setup" and finance_profile_ready(state) and action not in {"", "start"}:
-            return BotResponse(finance_profile_summary(state, source_text=text))
+        return BotResponse(setup_overview_text(state, source_text=text))
+
+    if command == "/train":
         return start_finance_setup(service, state, source_text=text)
 
     if command == "/health":
-        payload = service.client.health()
-        version = payload.get("data", {}).get("version") or payload.get("version") or "unknown"
-        return BotResponse(localize(f"Firefly bridge is healthy.\nVersion: {version}", f"Il bridge Firefly è sano.\nVersione: {version}", source_text=text))
+        return BotResponse(build_health_message(service, source_text=text))
 
     if command == "/backup":
         document_path, filename, backup = create_firefly_backup_document(service)
@@ -5597,7 +5808,12 @@ def process_message(service: BridgeService, text: str, state: dict[str, Any]) ->
         values = parse_kv_args(tail) if "=" in tail else {"month": tail.strip()} if tail.strip() else {}
         start, end, label = period_from_values(values, default_current_month=True)
         records = flatten_transactions(service.client.list_transactions(start=start, end=end, limit=300))
-        return BotResponse(format_budget_report(records, label=label, source_text=text))
+        budget_limits: dict[str, float] = {}
+        try:
+            budget_limits = collect_budget_limits(service, start, end)
+        except Exception:
+            pass
+        return BotResponse(format_budget_report(records, label=label, budget_limits=budget_limits, source_text=text))
 
     if command == "/setbudgetlimit":
         values = parse_kv_args(tail)
@@ -5782,7 +5998,7 @@ def process_message(service: BridgeService, text: str, state: dict[str, Any]) ->
         )
         return BotResponse(preview)
 
-    return BotResponse("Unsupported command.\n\n" + commands_text(text))
+    return BotResponse(bot_text("unsupported_command", source_text=text) + "\n\n" + commands_text(text))
 
 
 def boot_state_validator(state: dict) -> int:
@@ -5810,9 +6026,75 @@ def boot_state_validator(state: dict) -> int:
     return cleaned
 
 
+def build_health_message(service: BridgeService, *, source_text: str | None = None, prefix_key: str | None = None) -> str:
+    selected_prefix = prefix_key
+    try:
+        payload = service.client.health()
+        version = payload.get("data", {}).get("version") or payload.get("version") or "unknown"
+        body = localize(
+            f"Firefly bridge is healthy.\nVersion: {version}",
+            f"Il bridge Firefly e sano.\nVersione: {version}",
+            source_text=source_text,
+        )
+    except Exception as exc:
+        if prefix_key == "startup_ok":
+            selected_prefix = "startup_warn"
+        body = localize(
+            f"Firefly bridge health check failed: {exc}",
+            f"Controllo salute Firefly bridge fallito: {exc}",
+            source_text=source_text,
+        )
+    prefix = ""
+    if selected_prefix == "live_ping_ok":
+        prefix = bot_text_or_default("live_ping_ok", "Scheduled live check:", "Controllo programmato:", source_text=source_text)
+    elif selected_prefix == "startup_ok":
+        prefix = bot_text_or_default(
+            "startup_ok",
+            "Firefly bridge is healthy. Bot ready. /help shows what you can ask.",
+            "Firefly bridge sano. Bot pronto. /help mostra cosa puoi chiedermi.",
+            source_text=source_text,
+        )
+    elif selected_prefix == "startup_warn":
+        prefix = bot_text_or_default(
+            "startup_warn",
+            "Firefly bridge started with a warning. /help shows what you can ask.",
+            "Firefly bridge avviato con un avviso. /help mostra cosa puoi chiedermi.",
+            source_text=source_text,
+        )
+    elif selected_prefix:
+        prefix = bot_text_or_default(selected_prefix, "", "", source_text=source_text)
+    return f"{prefix}\n{body}".strip()
+
+
+def parse_live_ping_time(value: str) -> tuple[int, int] | None:
+    match = re.fullmatch(r"([01]?\d|2[0-3]):([0-5]\d)", value.strip())
+    if not match:
+        return None
+    return int(match.group(1)), int(match.group(2))
+
+
+def maybe_send_live_ping(bot_token: str, chat_id: str, service: BridgeService, state: dict[str, Any]) -> None:
+    if not LIVE_PING_ENABLED:
+        return
+    scheduled = parse_live_ping_time(LIVE_PING_TIME)
+    if scheduled is None:
+        return
+    now = datetime.now()
+    hour, minute = scheduled
+    if (now.hour, now.minute) < (hour, minute):
+        return
+    today_key = now.date().isoformat()
+    if state.get("last_live_ping_date") == today_key:
+        return
+    send_message(bot_token, chat_id, build_health_message(service, source_text=configured_chat_language(), prefix_key="live_ping_ok"))
+    state["last_live_ping_date"] = today_key
+    save_state(state)
+
+
 def main() -> int:
     bot_token = os.getenv("FIREFLY_TELEGRAM_BOT_TOKEN", os.getenv("TELEGRAM_BOT_TOKEN", "")).strip()
     owner_id = os.getenv("FIREFLY_TELEGRAM_OWNER_ID", os.getenv("TELEGRAM_OWNER_ID", "")).strip()
+    target_id = os.getenv("FIREFLY_TELEGRAM_TARGET_ID", os.getenv("TELEGRAM_TARGET_ID", owner_id)).strip() or owner_id
     if not bot_token or not owner_id:
         print("telegram_firefly_bot: TELEGRAM_BOT_TOKEN and TELEGRAM_OWNER_ID are required.", file=sys.stderr)
         return 0
@@ -5832,9 +6114,15 @@ def main() -> int:
         save_state(state)
     offset = int(state.get("offset", 0))
     initialized = bool(state.get("initialized", False))
+    if STARTUP_HEALTHCHECK_ENABLED:
+        try:
+            send_message(bot_token, target_id, build_health_message(service, source_text=configured_chat_language(), prefix_key="startup_ok"))
+        except TelegramBotError as exc:
+            print(f"telegram_firefly_bot: startup health notification failed: {exc}", file=sys.stderr)
 
     while True:
         try:
+            maybe_send_live_ping(bot_token, target_id, service, state)
             payload = telegram_request(
                 bot_token,
                 "getUpdates",
@@ -5849,12 +6137,16 @@ def main() -> int:
                 if results:
                     offset = max(int(update.get("update_id", 0)) + 1 for update in results)
                 initialized = True
-                save_state({"offset": offset, "initialized": True})
+                state["offset"] = offset
+                state["initialized"] = True
+                save_state(state)
                 continue
             for update in payload.get("result", []):
                 update_id = int(update.get("update_id", 0))
                 offset = max(offset, update_id + 1)
-                save_state({"offset": offset, "initialized": True})
+                state["offset"] = offset
+                state["initialized"] = True
+                save_state(state)
 
                 message = update.get("message") or {}
                 chat = message.get("chat") or {}

@@ -19,6 +19,9 @@ class TelegramLocalizationAndPeriodsTest(unittest.TestCase):
             commands_it = bot.commands_text()
             self.assertIn("linguaggio naturale", help_it)
             self.assertIn("Riferimento comandi", commands_it)
+            self.assertIn("/comandi", help_it)
+            self.assertIn("/saldi", commands_it)
+            self.assertNotIn("/balances", commands_it)
 
             os.environ["FIREFLY_CHAT_LANGUAGE"] = "en"
             help_en = bot.help_text()
