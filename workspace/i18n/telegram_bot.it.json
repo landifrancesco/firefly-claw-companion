@@ -30,7 +30,7 @@
     "draft_budget_select_hint": "Quale? (numero / no)",
     "draft_review_single": "Bozza preparata:",
     "draft_review_batch": "{count} transazioni preparate:",
-    "draft_review_confirm_hint": "Scrivi 'conferma' per salvare, o 'annulla' per scartare.",
+    "draft_review_confirm_hint": "Scrivi 'ok' per salvare, o 'annulla' per scartare.",
     "draft_correction_hint": "Puoi anche dire: 'cambia importo a X', 'cambia categoria', 'rileggi'.",
     "draft_no_category": "Non ho determinato una categoria. Quale uso? (scrivi un nome, o 'salta')",
     "receipt_counting": "Ho trovato {count} transazioni nell'immagine.",

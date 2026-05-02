@@ -196,7 +196,7 @@ class DraftManagerReviewTest(unittest.TestCase):
         self.assertIn("10.00", msg)
         self.assertIn("Coffee", msg)
         self.assertIn("Bar", msg)
-        self.assertIn("conferma", msg)
+        self.assertIn("ok", msg)
 
     def test_batch_review_shows_count(self) -> None:
         manager = self._make_manager()

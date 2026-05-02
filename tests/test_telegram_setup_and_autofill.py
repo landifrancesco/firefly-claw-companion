@@ -31,6 +31,64 @@ class _FakeService:
     client = _FakeClient()
 
 
+class _FakeSettings:
+    mappings: dict[str, Any] = {}
+    policy: dict[str, Any] = {}
+    high_value_threshold = 1000
+
+
+class _DraftService:
+    def __init__(self) -> None:
+        self.client = _FakeClient()
+        self.settings = _FakeSettings()
+        self.last_payload: dict[str, Any] | None = None
+
+    def resolve_merchant_rule(self, merchant: str | None) -> dict[str, Any]:
+        return {}
+
+    def build_transaction(
+        self,
+        *,
+        transaction_kind: str,
+        amount: str,
+        description: str,
+        transaction_date: str | None,
+        source_name: str | None,
+        destination_name: str | None,
+        category_name: str | None,
+        budget_name: str | None,
+        notes: str | None,
+        tags: list[str] | None,
+        merchant: str | None,
+        currency_code: str | None,
+    ) -> dict[str, Any]:
+        self.last_payload = {
+            "transactions": [
+                {
+                    "type": transaction_kind,
+                    "amount": amount,
+                    "date": transaction_date or "2026-05-02",
+                    "description": description,
+                    "source_name": source_name,
+                    "destination_name": destination_name,
+                    "category_name": category_name,
+                    "budget_name": budget_name,
+                    "notes": notes,
+                    "tags": tags or [],
+                    "currency_code": currency_code,
+                }
+            ]
+        }
+        return self.last_payload
+
+    def commit_transaction(self, payload: dict[str, Any], *, dry_run: bool, confirm_high_value: bool) -> dict[str, Any]:
+        self.last_payload = payload
+        return {"status": "dry_run" if dry_run else "created", "payload": payload, "result": {}}
+
+    def find_duplicate(self, payload: dict[str, Any]) -> None:
+        return None
+
+
 class TelegramSetupAndAutofillTest(unittest.TestCase):
     def test_match_choice_supports_number_and_name(self) -> None:
         choices = ["Main Checking", "Cash"]
@@ -264,6 +322,242 @@ class TelegramSetupAndAutofillTest(unittest.TestCase):
             "Main Checking",
         )
         self.assertEqual(bot.clean_transaction_description("Caffe pagato con carta oggi"), "Caffe")
+
+    def test_trained_card_alias_overrides_router_source(self) -> None:
+        service = _DraftService()
+        state = {
+            "finance_profile": {
+                "setup_complete": True,
+                "expense_source_account": "Main Checking",
+                "expense_destination_account": "Misc Expenses",
+                "income_destination_account": "Main Checking",
+                "payment_method_accounts": {"card": "Main Checking"},
+                "ask_budget_when_missing": True,
+                "auto_budget_from_history": True,
+            }
+        }
+        payload = {
+            "intent": "create_expense",
+            "source_text": "Aggiungi 14 euro per cibo pagando con carta",
+            "params": {
+                "amount": "14",
+                "description": "cibo",
+                "source": "Cards",
+                "destination": "Misc Expenses",
+                "category": None,
+            },
+        }
+
+        bot.execute_intent(service, payload, state)
+
+        self.assertIsNotNone(service.last_payload)
+        tx = service.last_payload["transactions"][0]
+        self.assertEqual(tx["source_name"], "Main Checking")
+        self.assertNotEqual(tx["source_name"], "Cards")
+
+    def test_relative_transaction_date_overrides_router_date(self) -> None:
+        service = _DraftService()
+        state = {
+            "finance_profile": {
+                "setup_complete": True,
+                "expense_source_account": "Main Checking",
+                "expense_destination_account": "Misc Expenses",
+            }
+        }
+        payload = {
+            "intent": "create_expense",
+            "source_text": "Aggiungi 14 euro per cibo pagando con carta ieri",
+            "params": {
+                "amount": "14",
+                "description": "cibo",
+                "date": "2024-07-28",
+                "source": "Main Checking",
+                "destination": "Misc Expenses",
+            },
+        }
+
+        bot.execute_intent(service, payload, state)
+
+        self.assertIsNotNone(service.last_payload)
+        tx = service.last_payload["transactions"][0]
+        self.assertEqual(tx["date"], (bot.date.today() - bot.timedelta(days=1)).isoformat())
+
+    def test_direct_italian_add_uses_trained_card_and_relative_date(self) -> None:
+        service = _DraftService()
+        state = {
+            "finance_profile": {
+                "setup_complete": True,
+                "expense_source_account": "Accounts",
+                "expense_destination_account": "Out",
+                "payment_method_accounts": {"card": "Accounts"},
+            }
+        }
+
+        response = bot.parse_direct_write_sentence(service, "Aggiungi 14€ per cibo pagando con carta ieri", state)
+
+        self.assertIsNotNone(response)
+        self.assertIsNotNone(service.last_payload)
+        tx = service.last_payload["transactions"][0]
+        self.assertEqual(tx["source_name"], "Accounts")
+        self.assertEqual(tx["destination_name"], "Out")
+        self.assertEqual(tx["description"], "cibo")
+        self.assertEqual(tx["date"], (bot.date.today() - bot.timedelta(days=1)).isoformat())
+
+    def test_direct_italian_add_with_di_description_uses_relative_date(self) -> None:
+        service = _DraftService()
+        state = {
+            "finance_profile": {
+                "setup_complete": True,
+                "expense_source_account": "Accounts",
+                "expense_destination_account": "Out",
+                "payment_method_accounts": {"card": "Accounts"},
+            }
+        }
+
+        response = bot.parse_direct_write_sentence(service, "aggiungi 10€ di Spesa pagati con carta ieri", state)
+
+        self.assertIsNotNone(response)
+        self.assertIsNotNone(service.last_payload)
+        tx = service.last_payload["transactions"][0]
+        self.assertEqual(tx["source_name"], "Accounts")
+        self.assertEqual(tx["destination_name"], "Out")
+        self.assertEqual(tx["description"], "Spesa")
+        self.assertEqual(tx["date"], (bot.date.today() - bot.timedelta(days=1)).isoformat())
+
+    def test_currency_spent_sentence_creates_draft_before_report_intent(self) -> None:
+        service = _DraftService()
+        state = {
+            "finance_profile": {
+                "setup_complete": True,
+                "expense_source_account": "Accounts",
+                "expense_destination_account": "Out",
+                "payment_method_accounts": {"card": "Accounts"},
+            }
+        }
+
+        response = bot.process_message(service, "Ho speso 14€ per cibo pagando con carta ieri", state)
+
+        self.assertIsNotNone(response)
+        self.assertIsNotNone(service.last_payload)
+        tx = service.last_payload["transactions"][0]
+        self.assertEqual(tx["source_name"], "Accounts")
+        self.assertEqual(tx["destination_name"], "Out")
+        self.assertEqual(tx["date"], (bot.date.today() - bot.timedelta(days=1)).isoformat())
+        self.assertIn("draft", state)
+
+    def test_cancel_clears_offline_retry_queue_and_pending_inputs(self) -> None:
+        service = _DraftService()
+        state = {
+            "retry_queue": [{"text": "ok"}],
+            "pending_description_input": {"payload_params": {}, "source_text": "x", "intent": "create_expense"},
+            "pending_draft_account_fix": {"field": "source"},
+            "pending_transaction_resolution": {"fields": ["source"]},
+            "pending_recurrence_suggestion": {"cadence": "monthly"},
+        }
+
+        response = bot.process_message(service, "/cancel", state)
+
+        self.assertIn("Cancelled", response.text)
+        self.assertNotIn("retry_queue", state)
+        self.assertNotIn("pending_description_input", state)
+        self.assertNotIn("pending_draft_account_fix", state)
+        self.assertNotIn("pending_transaction_resolution", state)
+        self.assertNotIn("pending_recurrence_suggestion", state)
+
+    def test_ok_is_commit_intent_case_insensitive(self) -> None:
+        self.assertTrue(bot.has_commit_intent("OK"))
+        self.assertTrue(bot.has_commit_intent("Si"))
+
+    def test_invalid_source_account_uses_trained_account_without_raw_error(self) -> None:
+        class FailingCommitService(_DraftService):
+            def commit_transaction(self, payload: dict[str, Any], *, dry_run: bool, confirm_high_value: bool) -> dict[str, Any]:
+                raise bot.FireflyAPIError(
+                    "Firefly III returned HTTP 422: {'message': '[a] Could not find a valid source account when searching for ID \"\" or name \"Cards\".'}"
+                )
+
+        service = FailingCommitService()
+        payload = {
+            "transactions": [
+                {
+                    "type": "withdrawal",
+                    "amount": "14.00",
+                    "date": "2026-05-02",
+                    "description": "Cibo",
+                    "source_name": "Cards",
+                    "destination_name": "Misc Expenses",
+                }
+            ]
+        }
+        state = {
+            "finance_profile": {
+                "setup_complete": True,
+                "expense_source_account": "Main Checking",
+                "expense_destination_account": "Misc Expenses",
+                "income_destination_account": "Main Checking",
+                "payment_method_accounts": {"card": "Main Checking"},
+            },
+            "pending_action": {"kind": "transaction_create", "payload": payload, "preview": ""},
+            "pending_transaction": payload,
+        }
+
+        response = bot.commit_pending_transaction(service, state, "conferma")
+
+        self.assertIn("Main Checking", response.text)
+        self.assertNotIn("HTTP 422", response.text)
+        self.assertNotIn("Could not find", response.text)
+        self.assertEqual(state["pending_action"]["payload"]["transactions"][0]["source_name"], "Main Checking")
+
+    def test_invalid_source_account_prompts_when_no_trained_account(self) -> None:
+        class FailingCommitService(_DraftService):
+            def commit_transaction(self, payload: dict[str, Any], *, dry_run: bool, confirm_high_value: bool) -> dict[str, Any]:
+                raise bot.FireflyAPIError(
+                    "Firefly III returned HTTP 422: {'errors': {'transactions.0.source_name': ['bad source']}}"
+                )
+
+        service = FailingCommitService()
+        payload = {
+            "transactions": [
+                {
+                    "type": "withdrawal",
+                    "amount": "14.00",
+                    "date": "2026-05-02",
+                    "description": "Cibo",
+                    "source_name": "Cards",
+                    "destination_name": "Misc Expenses",
+                }
+            ]
+        }
+        state = {
+            "pending_action": {"kind": "transaction_create", "payload": payload, "preview": ""},
+            "pending_transaction": payload,
+        }
+
+        response = bot.commit_pending_transaction(service, state, "conferma")
+
+        self.assertIn("not available in Firefly", response.text)
+        self.assertIn("Main Checking", response.text)
+        self.assertIn("pending_draft_account_fix", state)
+
+    def test_firefly_500_is_offline_retry_error(self) -> None:
+        exc = bot.FireflyAPIError(
+            "Firefly III returned HTTP 500: {'message': 'SQLSTATE[HY000] [2002] php_network_getaddresses: getaddrinfo for db failed'}"
+        )
+
+        self.assertTrue(bot.is_firefly_offline_error(exc))
+
+    def test_enqueue_offline_retry_preserves_message_for_hourly_retry(self) -> None:
+        state: dict[str, Any] = {"offset": 123, "finance_profile": {"setup_complete": True}}
+
+        response = bot.enqueue_offline_retry(state, text="conferma", chat_id="42", source_text="it")
+
+        self.assertIn("coda", response.text.casefold())
+        self.assertEqual(len(state["retry_queue"]), 1)
+        queued = state["retry_queue"][0]
+        self.assertEqual(queued["text"], "conferma")
+        self.assertEqual(queued["chat_id"], "42")
+        self.assertEqual(queued["max_attempts"], 3)
+        self.assertGreaterEqual(queued["next_at"] - time.time(), 3500)
+        self.assertNotIn("offset", queued["state"])
 
     def test_apply_profile_and_history_autofill_uses_history_for_category(self) -> None:
         service = _FakeService()

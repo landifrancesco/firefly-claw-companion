@@ -578,8 +578,8 @@ class DraftManager:
 
         lines.append("")
         lines.append(ctx.localized(
-            en="Say 'confirm' to save, or 'cancel' to discard.",
-            it="Scrivi 'conferma' per salvare, o 'annulla' per scartare.",
+            en="Say 'ok' to save, or 'cancel' to discard.",
+            it="Scrivi 'ok' per salvare, o 'annulla' per scartare.",
         ))
         lines.append(ctx.localized(
             en="You can also say: 'change amount to X', 'change description to Y', 'change category', 'change from X', 'change to X', 'list accounts', 're-read'. Use /cancel to force-discard.",

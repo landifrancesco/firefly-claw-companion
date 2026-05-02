@@ -59,6 +59,8 @@ LIVE_PING_ENABLED = os.getenv("TELEGRAM_LIVE_PING_ENABLED", "true").strip().lowe
 LIVE_PING_TIME = os.getenv("TELEGRAM_LIVE_PING_TIME", "09:00").strip()
 ITALIC_MARKER_PATTERN = re.compile(r"(?<!\w)_(?!\s)([^_\n]+?)(?<!\s)_(?!\w)")
 AUTOFILL_CACHE_SECONDS = 600
+OFFLINE_RETRY_DELAY_SECONDS = 60 * 60
+OFFLINE_RETRY_MAX_ATTEMPTS = 3
 PROFILE_SETUP_STEPS = (
     "expense_source_account",
     "expense_destination_account",
@@ -109,6 +111,8 @@ INTENT_VALUES = {
     "graph_balances",
     "graph_spending",
     "graph_cashflow",
+    "graph_budget",
+    "graph_recurrences",
     "top_spending_categories",
     "budget_report",
     "set_budget_limit",
@@ -370,6 +374,35 @@ def extract_relative_or_explicit_date_from_text(text: str) -> str | None:
     return None
 
 
+def enforce_deterministic_transaction_date(payload: dict[str, Any], text: str | None) -> dict[str, Any]:
+    """Make user-specified transaction dates win over router-provided dates."""
+    intent = str(payload.get("intent") or "").strip()
+    if intent not in {"create_expense", "create_income", "create_transfer", "create_transaction_batch"}:
+        return payload
+
+    date_value = extract_relative_or_explicit_date_from_text(text or "")
+    if not date_value:
+        return payload
+
+    params = payload.get("params")
+    if not isinstance(params, dict):
+        params = {}
+    if intent == "create_transaction_batch":
+        transactions = params.get("transactions")
+        if isinstance(transactions, list):
+            for item in transactions:
+                if not isinstance(item, dict):
+                    continue
+                item_params = item.get("params")
+                if isinstance(item_params, dict):
+                    item_params["date"] = date_value
+        payload["params"] = params
+        return payload
+
+    payload["params"] = {**params, "date": date_value}
+    return payload
+
+
 def coerce_transaction_date(value: Any) -> str | None:
     raw = str(value or "").strip()
     if not raw:
@@ -494,6 +527,124 @@ def save_state(state: dict[str, Any]) -> None:
         except Exception:
             pass
         raise
+
+
+def retry_state_snapshot(state: dict[str, Any]) -> dict[str, Any]:
+    snapshot = json.loads(json.dumps(state))
+    for key in ("retry_queue", "offset", "initialized", "_version", "_last_modified", "last_live_ping_date"):
+        snapshot.pop(key, None)
+    return snapshot
+
+
+def enqueue_offline_retry(state: dict[str, Any], *, text: str, chat_id: str, source_text: str | None = None) -> BotResponse:
+    queue = state.get("retry_queue")
+    if not isinstance(queue, list):
+        queue = []
+    now = time.time()
+    queue.append(
+        {
+            "text": text,
+            "chat_id": chat_id,
+            "attempts": 0,
+            "max_attempts": OFFLINE_RETRY_MAX_ATTEMPTS,
+            "next_at": now + OFFLINE_RETRY_DELAY_SECONDS,
+            "created_at": now,
+            "state": retry_state_snapshot(state),
+        }
+    )
+    state["retry_queue"] = queue
+    return BotResponse(
+        localize(
+            "Firefly looks offline. I queued this request and will retry up to 3 times, once per hour.",
+            "Firefly sembra offline. Ho messo questa richiesta in coda e riprovero fino a 3 volte, una volta all'ora.",
+            source_text=source_text,
+        )
+    )
+
+
+def process_due_offline_retries(service: BridgeService, bot_token: str, state: dict[str, Any]) -> None:
+    queue = state.get("retry_queue")
+    if not isinstance(queue, list) or not queue:
+        return
+    now = time.time()
+    kept: list[dict[str, Any]] = []
+    changed = False
+    for item in queue:
+        if not isinstance(item, dict):
+            changed = True
+            continue
+        next_at = float(item.get("next_at") or 0)
+        if next_at > now:
+            kept.append(item)
+            continue
+
+        text = str(item.get("text") or "").strip()
+        chat_id = str(item.get("chat_id") or "").strip()
+        attempts = int(item.get("attempts") or 0)
+        max_attempts = int(item.get("max_attempts") or OFFLINE_RETRY_MAX_ATTEMPTS)
+        retry_state = item.get("state") if isinstance(item.get("state"), dict) else {}
+        draft_state_keys = ("draft", "pending_action", "pending_transaction", "pending_draft_account_fix")
+        retry_had_draft_state = any(key in retry_state for key in draft_state_keys)
+        if not text or not chat_id or attempts >= max_attempts:
+            changed = True
+            continue
+
+        try:
+            response = process_message(service, text, retry_state)
+        except (ConfigurationError, FireflyAPIError, ValueError, RuntimeError) as exc:
+            if is_firefly_offline_error(exc):
+                attempts += 1
+                if attempts >= max_attempts:
+                    send_message(
+                        bot_token,
+                        chat_id,
+                        localize(
+                            "Firefly is still offline, so I stopped retrying that queued request after 3 attempts.",
+                            "Firefly e ancora offline, quindi ho interrotto quella richiesta in coda dopo 3 tentativi.",
+                            source_text=text,
+                        ),
+                    )
+                    changed = True
+                    continue
+                item["attempts"] = attempts
+                item["next_at"] = now + OFFLINE_RETRY_DELAY_SECONDS
+                kept.append(item)
+                changed = True
+                continue
+            response = BotResponse(
+                localize(
+                    "A queued request could not be completed. Please resend it when Firefly is available.",
+                    "Una richiesta in coda non e stata completata. Rimandala quando Firefly e disponibile.",
+                    source_text=text,
+                )
+            )
+
+        if response.photo_path:
+            send_photo(bot_token, chat_id, response.photo_path, response.text)
+            try:
+                Path(response.photo_path).unlink(missing_ok=True)
+            except OSError:
+                pass
+        elif response.document_path:
+            send_document(bot_token, chat_id, response.document_path, response.text, response.document_filename)
+            try:
+                Path(response.document_path).unlink(missing_ok=True)
+            except OSError:
+                pass
+        else:
+            send_message(bot_token, chat_id, response.text)
+
+        if retry_had_draft_state or any(key in retry_state for key in draft_state_keys):
+            for key in draft_state_keys:
+                if key in retry_state:
+                    state[key] = retry_state[key]
+                else:
+                    state.pop(key, None)
+        changed = True
+
+    state["retry_queue"] = kept
+    if changed:
+        save_state(state)
 
 
 def telegram_request(bot_token: str, method: str, *, params: dict[str, Any] | None = None, data: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -2060,6 +2211,13 @@ def has_cancel_intent(text: str) -> bool:
 def has_commit_intent(text: str) -> bool:
     lowered = text.strip().casefold()
     return lowered in {
+        "ok",
+        "okay",
+        "yes",
+        "y",
+        "si",
+        "sì",
+        "va bene",
         "commit it",
         "commit",
         "conferma",
@@ -2150,6 +2308,17 @@ def commit_pending_transaction(service: BridgeService, state: dict[str, Any], te
                 confirm_high_value=has_high_value_confirmation(text),
             )
         except (ConfigurationError, FireflyAPIError, ValueError, RuntimeError) as exc:
+            if is_firefly_offline_error(exc):
+                raise exc
+            if isinstance(exc, FireflyAPIError):
+                invalid_field = invalid_account_field_from_error(exc)
+                if invalid_field:
+                    return queue_pending_draft_account_fix(
+                        service,
+                        state,
+                        field=invalid_field,
+                        source_text=text,
+                    )
             save_draft_session(state, None)
             raise exc
 
@@ -2193,6 +2362,8 @@ def commit_pending_transaction(service: BridgeService, state: dict[str, Any], te
                     format_created_transaction_result(created, fallback_payload=item, source_text=text).replace("\n", " | ")
                 )
         except (ConfigurationError, FireflyAPIError, ValueError, RuntimeError) as exc:
+            if is_firefly_offline_error(exc):
+                raise exc
             save_draft_session(state, None)
             raise exc
         save_draft_session(state, None)
@@ -2679,25 +2850,118 @@ def collect_budget_limits(service: BridgeService, start: date, end: date) -> dic
     return budget_limits
 
 
+_FREQ_LABEL_IT = {"weekly": "settimanale", "monthly": "mensile", "yearly": "annuale", "daily": "giornaliera"}
+_FREQ_LABEL_EN = {"weekly": "weekly", "monthly": "monthly", "yearly": "yearly", "daily": "daily"}
+_TX_TYPE_LABEL_IT = {"withdrawal": "spesa", "deposit": "entrata", "transfer": "trasferimento"}
+_TX_TYPE_LABEL_EN = {"withdrawal": "expense", "deposit": "income", "transfer": "transfer"}
+
+
+def _recurrence_freq_label(freq: str, *, source_text: str | None = None) -> str:
+    freq = (freq or "").strip().lower()
+    if locale_language(source_text) == "it":
+        return _FREQ_LABEL_IT.get(freq, freq)
+    return _FREQ_LABEL_EN.get(freq, freq)
+
+
+def _recurrence_type_label(tx_type: str, *, source_text: str | None = None) -> str:
+    tx_type = (tx_type or "").strip().lower()
+    if locale_language(source_text) == "it":
+        return _TX_TYPE_LABEL_IT.get(tx_type, tx_type)
+    return _TX_TYPE_LABEL_EN.get(tx_type, tx_type)
+
+
 def format_recurrences(items: list[dict[str, Any]], *, source_text: str | None = None) -> str:
     if not items:
         return localize("No recurring transactions found.", "Nessuna transazione ricorrente trovata.", source_text=source_text)
 
-    lines = [localize("Recurring transactions:", "Transazioni ricorrenti:", source_text=source_text)]
-    for item in items[:20]:
+    is_it = locale_language(source_text) == "it"
+    header = localize("Recurring transactions:", "Transazioni ricorrenti:", source_text=source_text)
+    lines = [header]
+    total_monthly_expenses = 0.0
+    total_monthly_income = 0.0
+
+    for item in items[:25]:
         attributes = item.get("attributes", {})
-        title = attributes.get("title") or attributes.get("description") or "<unnamed>"
-        first_date = format_display_date(attributes.get("first_date") or "?")
-        repeat_until_raw = attributes.get("repeat_until")
-        repeat_until = format_display_date(repeat_until_raw) if repeat_until_raw else "open-ended"
+        active = attributes.get("active", True)
+        if not active:
+            continue
+
+        title = str(attributes.get("title") or attributes.get("description") or "<unnamed>")
+
         repetitions = attributes.get("repetitions") or []
-        cadence = []
-        if isinstance(repetitions, list):
-            for repetition in repetitions[:2]:
-                if isinstance(repetition, dict):
-                    cadence.append(str(repetition.get("type") or repetition.get("moment") or "?"))
-        cadence_text = ", ".join(cadence) if cadence else "custom"
-        lines.append(f"- #{item.get('id')} {title} | starts {first_date} | until {repeat_until} | {cadence_text}")
+        freq = "monthly"
+        if isinstance(repetitions, list) and repetitions:
+            rep = repetitions[0] if isinstance(repetitions[0], dict) else {}
+            freq = str(rep.get("type") or "monthly").lower()
+        freq_label = _recurrence_freq_label(freq, source_text=source_text)
+
+        next_date_raw = attributes.get("next_expected_match")
+        next_date = format_display_date(next_date_raw) if next_date_raw else "?"
+
+        txs = attributes.get("transactions") or []
+        tx = txs[0] if isinstance(txs, list) and txs and isinstance(txs[0], dict) else {}
+        amount_raw = str(tx.get("amount") or "0")
+        try:
+            amount = float(amount_raw)
+        except ValueError:
+            amount = 0.0
+        currency = str(tx.get("currency_code") or tx.get("foreign_currency_code") or "EUR")
+        tx_type = str(tx.get("type") or "withdrawal").lower()
+        type_label = _recurrence_type_label(tx_type, source_text=source_text)
+        source_name = str(tx.get("source_name") or "").strip()
+        dest_name = str(tx.get("destination_name") or "").strip()
+        category = str(tx.get("category_name") or "").strip()
+        budget = str(tx.get("budget_name") or "").strip()
+
+        if freq == "monthly":
+            if tx_type == "withdrawal":
+                total_monthly_expenses += amount
+            elif tx_type == "deposit":
+                total_monthly_income += amount
+        elif freq == "weekly":
+            normalized = amount * 52 / 12
+            if tx_type == "withdrawal":
+                total_monthly_expenses += normalized
+            elif tx_type == "deposit":
+                total_monthly_income += normalized
+        elif freq == "yearly":
+            normalized = amount / 12
+            if tx_type == "withdrawal":
+                total_monthly_expenses += normalized
+            elif tx_type == "deposit":
+                total_monthly_income += normalized
+
+        next_label = localize("next", "prossima", source_text=source_text)
+        line = f"- {title}: {currency} {amount:.2f} | {type_label} | {freq_label} | {next_label} {next_date}"
+        if source_name and dest_name:
+            line += f"\n  {source_name} → {dest_name}"
+        if category:
+            cat_label = localize("cat", "cat", source_text=source_text)
+            line += f" | {cat_label}: {category}"
+        if budget:
+            bud_label = localize("budget", "budget", source_text=source_text)
+            line += f" | {bud_label}: {budget}"
+        lines.append(line)
+
+    if total_monthly_expenses > 0 or total_monthly_income > 0:
+        net = total_monthly_income - total_monthly_expenses
+        sign = "+" if net >= 0 else ""
+        lines.append("")
+        if is_it:
+            lines.append(f"Totale mensile stimato:")
+            if total_monthly_income > 0:
+                lines.append(f"  Entrate: {total_monthly_income:.2f}")
+            if total_monthly_expenses > 0:
+                lines.append(f"  Uscite: {total_monthly_expenses:.2f}")
+            lines.append(f"  Netto: {sign}{net:.2f}")
+        else:
+            lines.append("Estimated monthly total:")
+            if total_monthly_income > 0:
+                lines.append(f"  Income: {total_monthly_income:.2f}")
+            if total_monthly_expenses > 0:
+                lines.append(f"  Expenses: {total_monthly_expenses:.2f}")
+            lines.append(f"  Net: {sign}{net:.2f}")
+
     return "\n".join(lines)
 
 
@@ -2911,6 +3175,143 @@ def create_balance_chart(balances: list[dict[str, Any]], *, source_text: str | N
     return tmp.name, caption
 
 
+def create_budget_chart(
+    budget_limits: dict[str, float],
+    budget_spent: dict[str, float],
+    *,
+    label: str,
+    source_text: str | None = None,
+) -> tuple[str, str]:
+    names = sorted(set(list(budget_limits.keys()) + list(budget_spent.keys())))
+    if not names:
+        raise RuntimeError("No budget data found.")
+
+    spent_vals = [budget_spent.get(n, 0.0) for n in names]
+    limit_vals = [budget_limits.get(n, 0.0) for n in names]
+    remaining_vals = [max(lim - sp, 0.0) for lim, sp in zip(limit_vals, spent_vals)]
+    over_vals = [max(sp - lim, 0.0) for lim, sp in zip(limit_vals, spent_vals)]
+
+    tmp = tempfile.NamedTemporaryFile(prefix="firefly-budget-", suffix=".png", delete=False)
+    tmp.close()
+
+    fig, ax = plt.subplots(figsize=(10, max(4.5, 0.7 * len(names) + 1.5)))
+    bar_h = 0.3
+    y = list(range(len(names)))
+    y_spent = [i + bar_h for i in y]
+    y_rem = [i - bar_h for i in y]
+
+    ax.barh(y_spent[::-1], spent_vals[::-1], height=bar_h, color="#d62728",
+            label=localize("Spent", "Speso", source_text=source_text))
+    ax.barh(y_rem[::-1], remaining_vals[::-1], height=bar_h, color="#2ca02c",
+            label=localize("Remaining", "Rimanente", source_text=source_text))
+    if any(v > 0 for v in over_vals):
+        ax.barh(y_spent[::-1], over_vals[::-1], height=bar_h, color="#ff7f0e",
+                label=localize("Over budget", "Oltre budget", source_text=source_text))
+
+    ax.set_yticks(y[::-1])
+    ax.set_yticklabels(names[::-1])
+    ax.set_title(localize(f"Budget usage ({label})", f"Utilizzo budget ({label})", source_text=source_text))
+    ax.set_xlabel(localize("Amount", "Importo", source_text=source_text))
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(tmp.name, dpi=160)
+    plt.close(fig)
+
+    summary_lines = [localize(f"Budget {label}:", f"Budget {label}:", source_text=source_text)]
+    for name in names:
+        sp = budget_spent.get(name, 0.0)
+        lim = budget_limits.get(name, 0.0)
+        if lim > 0:
+            rem = lim - sp
+            if rem >= 0:
+                summary_lines.append(localize(
+                    f"- {name}: {sp:.2f} / {lim:.2f}, {rem:.2f} remaining",
+                    f"- {name}: {sp:.2f} / {lim:.2f}, rimasti {rem:.2f}",
+                    source_text=source_text,
+                ))
+            else:
+                summary_lines.append(localize(
+                    f"- {name}: {sp:.2f} / {lim:.2f}, over by {abs(rem):.2f}",
+                    f"- {name}: {sp:.2f} / {lim:.2f}, oltre di {abs(rem):.2f}",
+                    source_text=source_text,
+                ))
+        else:
+            summary_lines.append(f"- {name}: {sp:.2f}")
+    caption = "\n".join(summary_lines)
+    return tmp.name, caption
+
+
+def create_recurrence_chart(
+    items: list[dict[str, Any]],
+    *,
+    source_text: str | None = None,
+) -> tuple[str, str]:
+    rows: list[tuple[str, float, str]] = []
+    for item in items:
+        attributes = item.get("attributes", {})
+        if not attributes.get("active", True):
+            continue
+        title = str(attributes.get("title") or attributes.get("description") or "<unnamed>")
+        repetitions = attributes.get("repetitions") or []
+        freq = "monthly"
+        if isinstance(repetitions, list) and repetitions:
+            rep = repetitions[0] if isinstance(repetitions[0], dict) else {}
+            freq = str(rep.get("type") or "monthly").lower()
+        txs = attributes.get("transactions") or []
+        tx = txs[0] if isinstance(txs, list) and txs and isinstance(txs[0], dict) else {}
+        amount_raw = str(tx.get("amount") or "0")
+        try:
+            amount = float(amount_raw)
+        except ValueError:
+            amount = 0.0
+        tx_type = str(tx.get("type") or "withdrawal").lower()
+        if freq == "weekly":
+            amount = amount * 52 / 12
+        elif freq == "yearly":
+            amount = amount / 12
+        rows.append((title, amount, tx_type))
+
+    if not rows:
+        raise RuntimeError("No active recurring transactions found.")
+
+    rows.sort(key=lambda r: r[1], reverse=True)
+    names = [r[0] for r in rows]
+    amounts = [r[1] for r in rows]
+    colors = []
+    for _, _, tx_type in rows:
+        if tx_type == "deposit":
+            colors.append("#2ca02c")
+        elif tx_type == "withdrawal":
+            colors.append("#d62728")
+        else:
+            colors.append("#1f77b4")
+
+    tmp = tempfile.NamedTemporaryFile(prefix="firefly-recur-", suffix=".png", delete=False)
+    tmp.close()
+
+    fig, ax = plt.subplots(figsize=(10, max(4.5, 0.5 * len(names) + 2.0)))
+    bars = ax.barh(names[::-1], amounts[::-1], color=colors[::-1])
+    ax.set_title(localize("Active recurring transactions (monthly equiv.)", "Ricorrenze attive (equiv. mensile)", source_text=source_text))
+    ax.set_xlabel(localize("Amount / month", "Importo / mese", source_text=source_text))
+    for bar, value in zip(bars, amounts[::-1]):
+        ax.text(bar.get_width(), bar.get_y() + bar.get_height() / 2, f"  {value:.2f}", va="center")
+    fig.tight_layout()
+    fig.savefig(tmp.name, dpi=160)
+    plt.close(fig)
+
+    total_exp = sum(a for _, a, t in rows if t == "withdrawal")
+    total_inc = sum(a for _, a, t in rows if t == "deposit")
+    net = total_inc - total_exp
+    sign = "+" if net >= 0 else ""
+    caption_lines = [localize("Active recurring (monthly equiv.):", "Ricorrenze attive (equiv. mensile):", source_text=source_text)]
+    if total_inc > 0:
+        caption_lines.append(localize(f"Income: {total_inc:.2f}", f"Entrate: {total_inc:.2f}", source_text=source_text))
+    if total_exp > 0:
+        caption_lines.append(localize(f"Expenses: {total_exp:.2f}", f"Uscite: {total_exp:.2f}", source_text=source_text))
+    caption_lines.append(localize(f"Net: {sign}{net:.2f}", f"Netto: {sign}{net:.2f}", source_text=source_text))
+    return tmp.name, "\n".join(caption_lines)
+
+
 def summarize_name_list(items: list[dict[str, Any]], *, limit: int = 25) -> list[str]:
     names: list[str] = []
     for item in items[:limit]:
@@ -3003,11 +3404,13 @@ def build_router_instructions(service: BridgeService) -> str:
         "- If the user asks for a graph/chart of balances/net worth/composition, use graph_balances.\n"
         "- If the user asks for a graph/chart of spending/expenses, use graph_spending.\n"
         "- If the user asks for incoming vs outgoing or cashflow, use graph_cashflow.\n"
+        "- If the user asks for a graph/chart of budget usage, budget limits, or how much budget is left, use graph_budget.\n"
+        "- If the user asks for a graph/chart of recurring transactions or recurring amounts, use graph_recurrences.\n"
         "- If the user asks where they spent the most last month, top categories, or a graph by category, use top_spending_categories.\n"
-        "- If the user asks about budgets, budget usage, or budget charts, use budget_report unless they are clearly asking to create a budget.\n"
+        "- If the user asks about budgets, budget usage, or budget charts, use graph_budget for a visual chart or budget_report for a text summary.\n"
         "- For reports, transaction searches, and graphs, preserve explicit time windows from the user. Use month for full-month requests and start_date/end_date for custom ranges.\n"
         "- If the user asks to set, raise, lower, or adjust a budget amount/limit for a month, use set_budget_limit.\n"
-        "- If the user asks to list recurring transactions, use list_recurrences.\n"
+        "- If the user asks to list recurring transactions, their amounts, or a summary of recurrences, use list_recurrences.\n"
         "- If the user asks to add a recurring transaction, use create_recurrence.\n"
         "- If the user asks to delete or remove a recurring transaction, use delete_recurrence.\n"
         "- If the user asks to add a new category, use create_category.\n"
@@ -3882,7 +4285,7 @@ def clean_free_text_slot(value: str | None) -> str | None:
     if not cleaned:
         return None
     payment_words = r"cash|contanti|contante|card|carta|bancomat|debit(?:o)?|credit(?:o)?|visa|mastercard|paypal|revolut|wise"
-    cleaned = re.sub(rf"\b(?:paid|made|pagato|pagata|pagati|pagate)\s+(?:with|con)\s+(?:{payment_words})\b.*$", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(rf"\b(?:paid|made|pagato|pagata|pagati|pagate|pagando)\s+(?:with|con)\s+(?:{payment_words})\b.*$", "", cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(rf"\b(?:with|con|in)\s+(?:{payment_words})\b.*$", "", cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r"\b(?:today|oggi|yesterday|ieri|tomorrow|domani)\b.*$", "", cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r"\b(?:on|il|del|della)\s+\d{1,2}[/-]\d{1,2}(?:[/-]\d{2,4})?\b.*$", "", cleaned, flags=re.IGNORECASE)
@@ -4138,12 +4541,25 @@ def parse_natural_intent_payload(text: str) -> dict[str, Any] | None:
     recent_words = {"recent", "recenti", "movimento", "movimenti", "transaction", "transactions", "transazione", "transazioni"}
     receipt_words = {"receipt", "ricevuta", "scontrino", "bank screenshot", "screenshot banca", "foto ricevuta", "foto scontrino"}
     send_words = {"send", "sending", "ti mando", "mando", "invio", "inoltro"}
+    budget_words = {"budget", "budget rimasto", "limite budget", "budget limit"}
+    recurrence_words = {"ricorrenza", "ricorrenze", "recurrence", "recurrences", "ricorrenti", "ricorrente", "recurring"}
 
     params = parse_natural_period_values(lowered)
     wants_all_categories = contains_any(lowered, all_words) and contains_any(lowered, category_words)
 
     if contains_any(lowered, receipt_words) and contains_any(lowered, send_words):
         return {"intent": "clarify", "confidence": 0.98, "reply": build_receipt_intro_reply(text), "source_text": text, "params": {}}
+
+    if contains_any(lowered, graph_words) and contains_any(lowered, budget_words):
+        return {"intent": "graph_budget", "confidence": 0.9, "reply": "", "source_text": text, "params": {**params}}
+
+    if contains_any(lowered, graph_words) and contains_any(lowered, recurrence_words):
+        return {"intent": "graph_recurrences", "confidence": 0.9, "reply": "", "source_text": text, "params": {}}
+
+    if contains_any(lowered, recurrence_words) and any(
+        w in lowered for w in {"mostra", "lista", "list", "show", "elenca", "vedi", "fammi vedere", "quali"}
+    ):
+        return {"intent": "list_recurrences", "confidence": 0.88, "reply": "", "source_text": text, "params": {}}
 
     comparison_periods = parse_compare_period_params(text)
     if comparison_periods is not None:
@@ -4354,6 +4770,8 @@ def interpret_natural_command(text: str) -> str | None:
         return "/topcategories"
     if explicit_period and contains_any(lowered, category_words):
         return None
+    budget_words = {"budget", "budget rimasto", "limite budget"}
+    recurrence_words = {"ricorrenz", "recurrenc", "ricorrenti", "ricorrente", "recurring"}
     if contains_any(lowered, graph_words):
         if explicit_period:
             return None
@@ -4365,6 +4783,10 @@ def interpret_natural_command(text: str) -> str | None:
             return "/graph spending 30"
         if contains_any(lowered, cashflow_words):
             return "/graph cashflow 30"
+        if contains_any(lowered, budget_words):
+            return "/graph budget"
+        if any(w in lowered for w in recurrence_words):
+            return "/graph recurrences"
         return "/graph balances 30"
     return None
 
@@ -4419,10 +4841,243 @@ def infer_account_from_payment_method(
     return None
 
 
+def configured_payment_account_for_text(
+    state: dict[str, Any],
+    text: str,
+    *,
+    locale: str = "en",
+) -> str | None:
+    payment_method = extract_payment_method(text, locale=locale)
+    if not payment_method:
+        return None
+    profile = get_finance_profile(state)
+    payment_accounts = profile.get("payment_method_accounts")
+    if not isinstance(payment_accounts, dict):
+        return None
+    configured = str(payment_accounts.get(payment_method) or "").strip()
+    return configured or None
+
+
+def invalid_account_field_from_error(exc: BaseException) -> str | None:
+    message = str(exc).casefold()
+    if "could not find a valid source account" in message or "transactions.0.source_" in message:
+        return "source"
+    if "could not find a valid destination account" in message or "transactions.0.destination_" in message:
+        return "destination"
+    return None
+
+
+def is_firefly_offline_error(exc: BaseException) -> bool:
+    if not isinstance(exc, FireflyAPIError):
+        return False
+    message = str(exc).casefold()
+    return (
+        "returned http 500" in message
+        or "returned http 502" in message
+        or "returned http 503" in message
+        or "returned http 504" in message
+        or "request to firefly iii failed" in message
+        or "php_network_getaddresses" in message
+        or "getaddrinfo" in message
+        or "connection refused" in message
+        or "connection timed out" in message
+    )
+
+
+def trained_account_for_failed_field(
+    payload: dict[str, Any],
+    field: str,
+    state: dict[str, Any],
+    *,
+    source_text: str | None = None,
+) -> str | None:
+    tx = _first_payload_transaction(payload)
+    transaction_type = str(tx.get("type") or "").strip()
+    profile = get_finance_profile(state)
+    combined_text = " ".join(
+        part
+        for part in [
+            source_text or "",
+            str(tx.get("description") or ""),
+            str(tx.get("notes") or ""),
+        ]
+        if part
+    )
+    payment_account = configured_payment_account_for_text(
+        state,
+        combined_text,
+        locale=locale_language(source_text),
+    )
+
+    if transaction_type == "withdrawal":
+        if field == "source":
+            return payment_account or str(profile.get("expense_source_account") or "").strip() or None
+        if field == "destination":
+            return str(profile.get("expense_destination_account") or "").strip() or None
+    if transaction_type == "deposit":
+        if field == "source":
+            return str(profile.get("income_source_account") or "").strip() or None
+        if field == "destination":
+            return payment_account or str(profile.get("income_destination_account") or "").strip() or None
+    return None
+
+
+def update_pending_transaction_account(
+    state: dict[str, Any],
+    *,
+    field: str,
+    account_name: str,
+) -> dict[str, Any] | None:
+    key = "source_name" if field == "source" else "destination_name"
+    pending = state.get("pending_action")
+    payload = pending.get("payload") if isinstance(pending, dict) else None
+    if not isinstance(payload, dict):
+        payload = state.get("pending_transaction")
+    if not isinstance(payload, dict):
+        return None
+
+    tx = _first_payload_transaction(payload)
+    if not tx:
+        return None
+    tx[key] = account_name
+
+    session = load_draft_session(state)
+    if session is not None and session.drafts:
+        draft = session.drafts[0]
+        if field == "source":
+            draft.source_name = account_name
+        else:
+            draft.destination_name = account_name
+        draft.payload = payload
+        draft.sync_payload()
+        session.phase = DraftPhase.REVIEW
+        save_draft_session(state, session)
+    else:
+        state["pending_transaction"] = payload
+        if isinstance(pending, dict):
+            pending["payload"] = payload
+            state["pending_action"] = pending
+    return payload
+
+
+def queue_pending_draft_account_fix(
+    service: BridgeService,
+    state: dict[str, Any],
+    *,
+    field: str,
+    source_text: str | None = None,
+) -> BotResponse:
+    pending = state.get("pending_action")
+    payload = pending.get("payload") if isinstance(pending, dict) else state.get("pending_transaction")
+    payload = payload if isinstance(payload, dict) else {}
+    trained_account = trained_account_for_failed_field(payload, field, state, source_text=source_text)
+    if trained_account:
+        updated = update_pending_transaction_account(state, field=field, account_name=trained_account)
+        if updated:
+            session = load_draft_session(state)
+            manager = build_draft_manager(service)
+            review = render_draft_session(manager, session) if session is not None else format_transaction_preview(
+                updated,
+                intro=localize("Draft updated.", "Bozza aggiornata.", source_text=source_text),
+                outro=localize("Say 'confirm' to save it.", "Scrivi 'conferma' per salvarla.", source_text=source_text),
+                source_text=source_text,
+            )
+            label = localize("source", "sorgente", source_text=source_text) if field == "source" else localize("destination", "destinazione", source_text=source_text)
+            return BotResponse(
+                localize(
+                    f"I switched the {label} account to your trained account: {trained_account}. Confirm again when ready.",
+                    f"Ho corretto il conto {label} usando quello scelto in /train: {trained_account}. Conferma di nuovo quando vuoi.",
+                    source_text=source_text,
+                )
+                + "\n\n"
+                + review
+            )
+
+    tx = _first_payload_transaction(payload)
+    intent = {
+        "withdrawal": "create_expense",
+        "deposit": "create_income",
+        "transfer": "create_transfer",
+    }.get(str(tx.get("type") or "").strip(), "create_expense")
+    options = intent_account_choices(service, intent, field, limit=15)
+    state["pending_draft_account_fix"] = {
+        "field": field,
+        "options": options,
+        "source_text": source_text or "",
+    }
+    return BotResponse(build_draft_account_fix_prompt(state))
+
+
+def build_draft_account_fix_prompt(state: dict[str, Any]) -> str:
+    pending = state.get("pending_draft_account_fix")
+    if not isinstance(pending, dict):
+        return "No account correction is pending."
+    field = str(pending.get("field") or "source")
+    source_text = str(pending.get("source_text") or "")
+    options = list(pending.get("options") or [])
+    if field == "source":
+        lines = [
+            localize(
+                "That source account is not available in Firefly. Choose the account that paid.",
+                "Quel conto sorgente non e disponibile in Firefly. Scegli il conto che ha pagato.",
+                source_text=source_text,
+            )
+        ]
+    else:
+        lines = [
+            localize(
+                "That destination account is not available in Firefly. Choose the account to use.",
+                "Quel conto destinazione non e disponibile in Firefly. Scegli il conto da usare.",
+                source_text=source_text,
+            )
+        ]
+    if options:
+        lines.append(localize("Available accounts:", "Conti disponibili:", source_text=source_text))
+        for index, name in enumerate(options, start=1):
+            lines.append(f"{index}. {name}")
+        lines.append(localize("Reply with account name or number.", "Rispondi con nome conto o numero.", source_text=source_text))
+    return "\n".join(lines)
+
+
+def handle_pending_draft_account_fix(service: BridgeService, state: dict[str, Any], text: str) -> BotResponse | None:
+    pending = state.get("pending_draft_account_fix")
+    if not isinstance(pending, dict):
+        return None
+    if text.strip().startswith("/"):
+        return None
+    if has_cancel_intent(text):
+        state.pop("pending_draft_account_fix", None)
+        return BotResponse(localize("Draft discarded.", "Bozza annullata.", source_text=text))
+
+    field = str(pending.get("field") or "source")
+    options = list(pending.get("options") or [])
+    resolved = match_choice(text, options) if options else text.strip()
+    if not resolved:
+        return BotResponse(build_draft_account_fix_prompt(state))
+    updated = update_pending_transaction_account(state, field=field, account_name=resolved)
+    state.pop("pending_draft_account_fix", None)
+    if not updated:
+        return BotResponse(localize("The pending draft is no longer available. Please send it again.", "La bozza in attesa non e piu disponibile. Rimandamela.", source_text=text))
+    session = load_draft_session(state)
+    manager = build_draft_manager(service)
+    review = render_draft_session(manager, session) if session is not None else format_transaction_preview(
+        updated,
+        intro=localize("Draft updated.", "Bozza aggiornata.", source_text=text),
+        outro=localize("Say 'confirm' to save it.", "Scrivi 'conferma' per salvarla.", source_text=text),
+        source_text=text,
+    )
+    return BotResponse(review)
+
+
 def execute_intent(service: BridgeService, payload: dict[str, Any], state: dict[str, Any]) -> BotResponse:
     intent = str(payload.get("intent", "")).strip()
     params = payload.get("params", {})
     source_text = str(payload.get("source_text") or "").strip() or None
+    if not isinstance(params, dict):
+        params = {}
+    payload["params"] = params
+    payload = enforce_deterministic_transaction_date(payload, source_text)
+    params = payload.get("params", {})
     if not isinstance(params, dict):
         params = {}
 
@@ -4755,6 +5410,22 @@ def execute_intent(service: BridgeService, payload: dict[str, Any], state: dict[
         photo_path, caption = create_cashflow_chart(records, days=max((end - start).days + 1, 1), label=label, source_text=source_text)
         return BotResponse(caption, photo_path=photo_path)
 
+    if intent == "graph_budget":
+        start, end, label = period_from_values(params, default_current_month=True)
+        records = flatten_transactions(service.client.list_transactions(start=start, end=end, limit=300))
+        budget_spent = aggregate_spending_by_budget(records)
+        try:
+            budget_limits_map = collect_budget_limits(service, start, end)
+        except Exception:
+            budget_limits_map = {}
+        photo_path, caption = create_budget_chart(budget_limits_map, budget_spent, label=label, source_text=source_text)
+        return BotResponse(caption, photo_path=photo_path)
+
+    if intent == "graph_recurrences":
+        items = service.client.list_recurrences()
+        photo_path, caption = create_recurrence_chart(items, source_text=source_text)
+        return BotResponse(caption, photo_path=photo_path)
+
     if intent in {"create_expense", "create_income", "create_transfer"}:
         transaction_kind = {
             "create_expense": "withdrawal",
@@ -4792,10 +5463,21 @@ def execute_intent(service: BridgeService, payload: dict[str, Any], state: dict[
             locale=locale_language(source_text),
             state=state,
         )
-        if transaction_kind == "withdrawal" and inferred_account and not str(params.get("source") or "").strip():
-            params["source"] = inferred_account
-        if transaction_kind == "deposit" and inferred_account and not str(params.get("destination") or "").strip():
-            params["destination"] = inferred_account
+        trained_payment_account = configured_payment_account_for_text(
+            state,
+            " ".join(part for part in [source_text or "", description] if part),
+            locale=locale_language(source_text),
+        )
+        if transaction_kind == "withdrawal":
+            if trained_payment_account:
+                params["source"] = trained_payment_account
+            elif inferred_account and not str(params.get("source") or "").strip():
+                params["source"] = inferred_account
+        if transaction_kind == "deposit":
+            if trained_payment_account:
+                params["destination"] = trained_payment_account
+            elif inferred_account and not str(params.get("destination") or "").strip():
+                params["destination"] = inferred_account
 
         missing_fields: list[str] = []
         if transaction_kind == "withdrawal":
@@ -4914,21 +5596,30 @@ def execute_intent(service: BridgeService, payload: dict[str, Any], state: dict[
         )
         save_draft_session(state, session)
 
-        # Detect recurrence pattern
+        response_text = render_draft_session(manager, session)
+
+        # Detect recurrence pattern and suggest creating one
         recurrence_type = extract_recurrence(source_text or "")
-        if recurrence_type:
-            state["pending_recurrence"] = {
-                "type": recurrence_type,
+        if recurrence_type and transaction_kind in {"withdrawal", "deposit"}:
+            state["pending_recurrence_suggestion"] = {
+                "cadence": recurrence_type,
                 "amount": amount,
                 "description": description,
+                "transaction_kind": transaction_kind,
                 "source": str(params.get("source") or "").strip() or None,
                 "destination": str(params.get("destination") or "").strip() or None,
                 "category": str(params.get("category") or "").strip() or None,
+                "budget": str(params.get("budget") or "").strip() or None,
+                "date": coerce_transaction_date(params.get("date")),
             }
-
-        response_text = render_draft_session(manager, session)
-        if recurrence_type:
-            response_text += f"\n\n🔄 {localize('Recurring', 'Ricorrente', source_text=source_text)}: {recurrence_type}"
+            freq_label = _recurrence_freq_label(recurrence_type, source_text=source_text)
+            response_text += "\n\n" + localize(
+                f"This looks like a recurring {transaction_kind}: {freq_label}.\n"
+                "Want me to create a recurrence too? (yes/no)",
+                f"Sembra una transazione ricorrente: {freq_label}.\n"
+                "Vuoi creare anche una ricorrenza? (si/no)",
+                source_text=source_text,
+            )
         return BotResponse(response_text)
 
     if intent == "create_transaction_batch":
@@ -5075,6 +5766,7 @@ def parse_direct_write_sentence(service: BridgeService, text: str, state: dict[s
         r"\bexpense\b", r"\bspent\b", r"\bpaid\b", r"\bbought\b",
         r"\bpagato\b", r"\bcomprato\b", r"ho\s+speso\b", r"ho\s+pagato\b",
         r"\badd\s+(?:an?\s+)?expense\b", r"\baggiungi\s+(?:una?\s+)?spesa\b",
+        r"\baggiungi\b(?=.*(?:€|eur(?:o)?))",
     ]
     income_patterns = [
         r"\bincome\b", r"\bsalary\b", r"\breceived\b", r"\bdeposit\b",
@@ -5128,6 +5820,10 @@ def parse_direct_write_sentence(service: BridgeService, text: str, state: dict[s
     description_match = re.search(r'\b(?:for|per)\s+([a-zA-ZÀ-ÿ][a-zA-ZÀ-ÿ0-9 _-]{1,60})', text, re.IGNORECASE)
     if description_match:
         description_hint = clean_free_text_slot(description_match.group(1))
+    if not description_hint:
+        di_match = re.search(r'\bdi\s+([^\d.,;:!?]+)', text, re.IGNORECASE)
+        if di_match:
+            description_hint = clean_free_text_slot(di_match.group(1))
 
     at_match = re.search(r'\b(?:at|da|presso)\s+([a-zA-ZÀ-ÿ][a-zA-ZÀ-ÿ0-9 _-]{1,60})', text, re.IGNORECASE)
     if at_match:
@@ -5168,6 +5864,16 @@ def parse_direct_write_sentence(service: BridgeService, text: str, state: dict[s
     }
     try:
         return execute_intent(service, payload, state)
+    except FireflyAPIError as exc:
+        if is_firefly_offline_error(exc):
+            raise
+        return BotResponse(
+            localize(
+                f"I got part of it, but I still need a safer mapping. {exc}",
+                f"Ho capito una parte della richiesta, ma mi serve un'associazione piu sicura. {exc}",
+                source_text=text,
+            )
+        )
     except RuntimeError as exc:
         return BotResponse(
             localize(
@@ -5363,6 +6069,110 @@ def process_message(service: BridgeService, text: str, state: dict[str, Any]) ->
                 )
             )
 
+    # Handle pending recurrence suggestion (yes/no after draft with recurrence keywords)
+    pending_recurrence_suggestion = state.get("pending_recurrence_suggestion")
+    if isinstance(pending_recurrence_suggestion, dict) and not text.strip().startswith("/"):
+        lowered_answer = normalize_natural_text(text)
+        if has_cancel_intent(text) or any(w in lowered_answer for w in {"no", "nope", "nein", "non"}):
+            state.pop("pending_recurrence_suggestion", None)
+            return BotResponse(localize("Got it, no recurrence created.", "Ok, nessuna ricorrenza creata.", source_text=text))
+        if any(w in lowered_answer for w in {"yes", "si", "sì", "ok", "sure", "vai", "crea", "create"}):
+            state.pop("pending_recurrence_suggestion", None)
+            cadence = str(pending_recurrence_suggestion.get("cadence") or "monthly")
+            rec_params = {
+                "amount": str(pending_recurrence_suggestion.get("amount") or ""),
+                "description": str(pending_recurrence_suggestion.get("description") or ""),
+                "title": str(pending_recurrence_suggestion.get("description") or ""),
+                "cadence": cadence,
+                "source": pending_recurrence_suggestion.get("source"),
+                "destination": pending_recurrence_suggestion.get("destination"),
+                "category": pending_recurrence_suggestion.get("category"),
+                "budget": pending_recurrence_suggestion.get("budget"),
+                "date": pending_recurrence_suggestion.get("date"),
+            }
+            try:
+                recurrence_payload = recurrence_payload_from_params(service, rec_params)
+            except RuntimeError as exc:
+                return BotResponse(str(exc))
+            title = recurrence_payload.get("title") or "Recurring transaction"
+            freq_label = _recurrence_freq_label(cadence, source_text=text)
+            preview = format_pending_action_preview(
+                localize("Recurrence draft prepared.", "Bozza ricorrenza preparata.", source_text=text),
+                [
+                    localize(f"Name: {title}", f"Nome: {title}", source_text=text),
+                    localize(f"Frequency: {freq_label}", f"Frequenza: {freq_label}", source_text=text),
+                    localize(f"Starts: {recurrence_payload.get('first_date', '?')}", f"Inizio: {recurrence_payload.get('first_date', '?')}", source_text=text),
+                    localize(f"Amount: {rec_params['amount']}", f"Importo: {rec_params['amount']}", source_text=text),
+                ],
+                localize(
+                    "Say 'commit it' to create this recurrence.",
+                    "Scrivi 'conferma' per crearla.",
+                    source_text=text,
+                ),
+            )
+            remember_pending_action(state, kind="recurrence_create", payload=recurrence_payload, preview=preview)
+            return BotResponse(preview)
+
+    # Handle "make it recurring" / "rendila ricorrente" on active draft
+    if not text.strip().startswith("/"):
+        recur_from_draft_words = {
+            "rendila ricorrente", "rendi ricorrente", "rendilo ricorrente",
+            "make it recurring", "make this recurring", "make recurrent",
+            "questa si ripete", "questa spesa si ripete", "si ripete",
+        }
+        lowered_msg = normalize_natural_text(text)
+        if any(phrase in lowered_msg for phrase in recur_from_draft_words) or (
+            any(w in lowered_msg for w in {"ricorrente", "ricorrenza", "recurring", "recurrence"})
+            and extract_recurrence(text)
+        ):
+            pending_action = state.get("pending_action")
+            draft_session = load_draft_session(state)
+            tx_data: dict[str, Any] | None = None
+            if isinstance(pending_action, dict) and pending_action.get("kind") == "transaction_create":
+                payload_tx = pending_action.get("payload", {})
+                tx_list = payload_tx.get("transactions") or []
+                if tx_list and isinstance(tx_list[0], dict):
+                    tx_data = tx_list[0]
+            elif draft_session is not None and draft_session.is_active:
+                session_txs = getattr(draft_session, "transactions", None) or []
+                if session_txs and isinstance(session_txs[0], dict):
+                    tx_data = session_txs[0]
+            if tx_data:
+                cadence = extract_recurrence(text) or "monthly"
+                rec_params = {
+                    "amount": str(tx_data.get("amount") or ""),
+                    "description": str(tx_data.get("description") or ""),
+                    "title": str(tx_data.get("description") or ""),
+                    "cadence": cadence,
+                    "source": tx_data.get("source_name"),
+                    "destination": tx_data.get("destination_name"),
+                    "category": tx_data.get("category_name"),
+                    "budget": tx_data.get("budget_name"),
+                    "date": str(tx_data.get("date") or "")[:10] or None,
+                }
+                try:
+                    recurrence_payload = recurrence_payload_from_params(service, rec_params)
+                except RuntimeError as exc:
+                    return BotResponse(str(exc))
+                freq_label = _recurrence_freq_label(cadence, source_text=text)
+                title = recurrence_payload.get("title") or "Recurring transaction"
+                preview = format_pending_action_preview(
+                    localize("Recurrence draft prepared.", "Bozza ricorrenza preparata.", source_text=text),
+                    [
+                        localize(f"Name: {title}", f"Nome: {title}", source_text=text),
+                        localize(f"Frequency: {freq_label}", f"Frequenza: {freq_label}", source_text=text),
+                        localize(f"Starts: {recurrence_payload.get('first_date', '?')}", f"Inizio: {recurrence_payload.get('first_date', '?')}", source_text=text),
+                        localize(f"Amount: {rec_params['amount']}", f"Importo: {rec_params['amount']}", source_text=text),
+                    ],
+                    localize(
+                        "Say 'commit it' to create this recurrence.",
+                        "Scrivi 'conferma' per crearla.",
+                        source_text=text,
+                    ),
+                )
+                remember_pending_action(state, kind="recurrence_create", payload=recurrence_payload, preview=preview)
+                return BotResponse(preview)
+
     # Handle pending description input
     pending_desc = state.get("pending_description_input")
     if pending_desc and not text.startswith("/"):
@@ -5390,15 +6200,19 @@ def process_message(service: BridgeService, text: str, state: dict[str, Any]) ->
     if maintenance_response is not None:
         return maintenance_response
 
+    draft_account_fix_response = handle_pending_draft_account_fix(service, state, text)
+    if draft_account_fix_response is not None:
+        return draft_account_fix_response
+
     resolution_response = handle_pending_transaction_resolution(service, state, text)
     if resolution_response is not None:
         return resolution_response
 
     if not text.strip().startswith("/"):
-        if has_commit_intent(text):
+        draft_session = load_draft_session(state)
+        if has_commit_intent(text) and (draft_session is None or getattr(draft_session, "phase", None) == DraftPhase.REVIEW):
             return commit_pending_transaction(service, state, text)
 
-        draft_session = load_draft_session(state)
         if draft_session is not None and draft_session.is_active:
             manager = build_draft_manager(service)
             if has_cancel_intent(text):
@@ -5452,16 +6266,18 @@ def process_message(service: BridgeService, text: str, state: dict[str, Any]) ->
             save_draft_session(state, draft_session)
             return BotResponse(advanced or manager.build_review_message(draft_session))
 
+        direct_write = parse_direct_write_sentence(service, text, state)
+        if direct_write is not None:
+            return direct_write
+
         natural_payload = parse_natural_intent_payload(text)
         if natural_payload is not None:
             try:
                 return execute_intent(service, natural_payload, state)
             except (ConfigurationError, FireflyAPIError, ValueError, RuntimeError) as exc:
+                if is_firefly_offline_error(exc):
+                    raise
                 return BotResponse(f"Request failed: {exc}")
-
-        direct_write = parse_direct_write_sentence(service, text, state)
-        if direct_write is not None:
-            return direct_write
 
         shortcut = interpret_natural_command(text)
         if shortcut is not None:
@@ -5490,10 +6306,13 @@ def process_message(service: BridgeService, text: str, state: dict[str, Any]) ->
                         source_text=text
                     ))
             if ai_payload is not None:
+                ai_payload.setdefault("source_text", text)
                 ai_payload = enforce_deterministic_period(ai_payload, text)
                 try:
                     return execute_intent(service, ai_payload, state)
                 except (ConfigurationError, FireflyAPIError, ValueError, RuntimeError) as exc:
+                    if is_firefly_offline_error(exc):
+                        raise
                     return BotResponse(f"Request failed: {exc}")
             command_text = text.strip()
     else:
@@ -5537,7 +6356,11 @@ def process_message(service: BridgeService, text: str, state: dict[str, Any]) ->
         state.pop("add_flow", None)
         state.pop("maintenance_mode", None)
         state.pop("profile_setup", None)
+        state.pop("pending_description_input", None)
+        state.pop("pending_draft_account_fix", None)
         state.pop("pending_transaction_resolution", None)
+        state.pop("pending_recurrence_suggestion", None)
+        state.pop("retry_queue", None)
         draft_session = load_draft_session(state)
         if draft_session is not None:
             manager = build_draft_manager(service)
@@ -5865,12 +6688,22 @@ def process_message(service: BridgeService, text: str, state: dict[str, Any]) ->
     if command == "/graph":
         tokens = tail.split()
         if not tokens:
-            return BotResponse("Usage: /graph spending [days] or /graph cashflow [days]")
+            return BotResponse(
+                localize(
+                    "Usage: /graph <type> [period]\n"
+                    "Types: balances, spending, cashflow, budget, recurrences\n"
+                    "Example: /graph budget month=2026-05",
+                    "Uso: /graph <tipo> [periodo]\n"
+                    "Tipi: saldi, spese, cashflow, budget, ricorrenze\n"
+                    "Esempio: /graph budget month=2026-05",
+                    source_text=text,
+                )
+            )
         graph_kind = tokens[0].casefold()
         values = parse_kv_args(" ".join(tokens[1:])) if any("=" in token for token in tokens[1:]) else {}
         if "days" not in values and len(tokens) > 1 and tokens[1].isdigit():
             values["days"] = tokens[1]
-        if graph_kind in {"spending", "category", "categories", "categoria", "categorie"}:
+        if graph_kind in {"spending", "category", "categories", "categoria", "categorie", "spese"}:
             start, end, _ = period_from_values(values, default_days=int(values.get("days") or 30))
             records = flatten_transactions(service.client.list_transactions(start=start, end=end, limit=100))
             chart_label = month_label_for_window(start, end)
@@ -5889,10 +6722,28 @@ def process_message(service: BridgeService, text: str, state: dict[str, Any]) ->
             chart_label = month_label_for_window(start, end)
             photo_path, caption = create_cashflow_chart(records, days=max((end - start).days + 1, 1), label=chart_label, source_text=text)
             return BotResponse(caption, photo_path=photo_path)
-        if graph_kind == "balances":
+        if graph_kind in {"balances", "balance", "saldi"}:
             photo_path, caption = create_balance_chart(service.account_balances(), source_text=text)
             return BotResponse(caption, photo_path=photo_path)
-        return BotResponse("Unsupported graph. Use balance, spending, or cashflow.")
+        if graph_kind == "budget":
+            start, end, label = period_from_values(values, default_current_month=True)
+            records = flatten_transactions(service.client.list_transactions(start=start, end=end, limit=300))
+            budget_spent = aggregate_spending_by_budget(records)
+            try:
+                budget_limits_map = collect_budget_limits(service, start, end)
+            except Exception:
+                budget_limits_map = {}
+            photo_path, caption = create_budget_chart(budget_limits_map, budget_spent, label=label, source_text=text)
+            return BotResponse(caption, photo_path=photo_path)
+        if graph_kind in {"recurrences", "ricorrenze", "recurring", "ricorrenti"}:
+            items = service.client.list_recurrences()
+            photo_path, caption = create_recurrence_chart(items, source_text=text)
+            return BotResponse(caption, photo_path=photo_path)
+        return BotResponse(localize(
+            "Unsupported graph type. Use: balances, spending, cashflow, budget, recurrences.",
+            "Tipo di grafico non supportato. Usa: saldi, spese, cashflow, budget, ricorrenze.",
+            source_text=text,
+        ))
 
     if command in {"/expense", "/income", "/transfer"}:
         values = parse_kv_args(tail)
@@ -6123,6 +6974,7 @@ def main() -> int:
     while True:
         try:
             maybe_send_live_ping(bot_token, target_id, service, state)
+            process_due_offline_retries(service, bot_token, state)
             payload = telegram_request(
                 bot_token,
                 "getUpdates",
@@ -6176,7 +7028,15 @@ def main() -> int:
                     else:
                         response = process_message(service, text, state)
                 except (ConfigurationError, FireflyAPIError, ValueError, RuntimeError) as exc:
-                    response = BotResponse(f"Request failed: {exc}")
+                    if is_firefly_offline_error(exc) and text:
+                        response = enqueue_offline_retry(
+                            state,
+                            text=text,
+                            chat_id=str(chat.get("id")),
+                            source_text=text,
+                        )
+                    else:
+                        response = BotResponse(f"Request failed: {exc}")
 
                 if response.photo_path:
                     send_photo(bot_token, str(chat.get("id")), response.photo_path, response.text)

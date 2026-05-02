@@ -30,7 +30,7 @@
     "draft_budget_select_hint": "Which one? (number / no)",
     "draft_review_single": "Draft prepared:",
     "draft_review_batch": "{count} transactions prepared:",
-    "draft_review_confirm_hint": "Say 'confirm' to save, or 'cancel' to discard.",
+    "draft_review_confirm_hint": "Say 'ok' to save, or 'cancel' to discard.",
     "draft_correction_hint": "You can also say: 'change amount to X', 'change category', 're-read'.",
     "draft_no_category": "I couldn't determine a category. Which one should I use? (type a name, or 'skip')",
     "receipt_counting": "I found {count} transactions in the image.",
