@@ -1,10 +1,8 @@
 # firefly-claw-companion
 
-![firefly-claw-companion](docs/assets/firefly_claw_companion.png)
+<img src="docs/assets/firefly_claw_companion.png" alt="firefly-claw-companion" width="520">
 
 A Telegram bot companion for [Firefly III](https://www.firefly-iii.org/) that understands plain language. You can ask things like "how much did I spend on food last month" or "add an expense of 12 euros for coffee" and it will handle it. Write operations are dry-run by default so nothing gets saved until you confirm.
-
-**Repository:** https://github.com/landifrancesco/firefly-claw-companion
 
 ---
 
