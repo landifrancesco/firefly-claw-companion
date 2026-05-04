@@ -34,7 +34,17 @@
     "draft_correction_hint": "Puoi anche dire: 'cambia importo a X', 'cambia categoria', 'rileggi'.",
     "draft_no_category": "Non ho determinato una categoria. Quale uso? (scrivi un nome, o 'salta')",
     "receipt_counting": "Ho trovato {count} transazioni nell'immagine.",
-    "receipt_amount_unreadable": "Non riesco a leggere l'importo. Puoi dirmelo?"
+    "receipt_amount_unreadable": "Non riesco a leggere l'importo. Puoi dirmelo?",
+    "withdraw_draft_title": "Bozza prelievo ATM:",
+    "transfer_missing_source": "Mi serve il conto da cui trasferire.",
+    "transfer_missing_destination": "Mi serve il conto verso cui trasferire.",
+    "budget_remaining_label": "Budget rimasto: {amount}",
+    "recurrence_cadence_label": "Frequenza: {cadence}",
+    "router_down_warning": "Router non disponibile. Prova /aiuto o un comando diretto.",
+    "income_no_source": "Entrata registrata senza conto sorgente lato ricavo. Aggiungilo con /impara se serve.",
+    "amount_missing": "Mi serve ancora l'importo. Esempio: aggiungi una spesa di 12,50 per pranzo.",
+    "search_no_results": "Nessuna transazione trovata per \"{query}\".",
+    "search_results_title": "Transazioni trovate per \"{query}\":"
   },
   "lists": {
     "command_lines": [

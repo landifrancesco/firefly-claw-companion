@@ -13,12 +13,16 @@ from firefly_companion.conversation import clean_free_text_slot, normalize_natur
 from firefly_companion.date_parser import parse_natural_period_values
 
 
-def contains_any(text: str, words: set[str]) -> bool:
-    """Check if any of the target words exist in the text as full words or prefixes."""
-    for word in words:
-        if re.search(rf"\b{word}", text):
-            return True
-    return False
+def contains_any(text: str, words: set[str] | tuple[str, ...]) -> bool:
+    """Check if any target phrase exists in normalized text."""
+    return any(word in text for word in words)
+
+
+def parse_amount_from_text(text: str) -> str | None:
+    match = re.search(r'(\d+(?:[.,]\d{1,2})?)\s*(?:â‚¬|eur|euro|usd|\$)?', text, re.IGNORECASE)
+    if not match:
+        return None
+    return match.group(1).replace(",", ".")
 
 
 def extract_recent_query(text: str) -> str | None:
@@ -82,25 +86,70 @@ def parse_natural_intent_payload(text: str) -> dict[str, Any] | None:
     recent_words = {"recent", "recenti", "movimento", "movimenti", "transaction", "transactions", "transazione", "transazioni"}
     receipt_words = {"receipt", "ricevuta", "scontrino", "bank screenshot", "screenshot banca", "foto ricevuta", "foto scontrino"}
     send_words = {"send", "sending", "ti mando", "mando", "invio", "inoltro"}
-    show_words = {"mostra", "mostrami", "fammi vedere", "show", "show me", "elenca", "list"}
-    list_trigger_words = {"lista", "list", "mostra", "elenca", "show", "fammi vedere", "quali sono", "dimmi", "cosa sono", "i miei", "my"}
+    budget_words = {"budget", "budget rimasto", "limite budget", "budget limit"}
+    recurrence_words = {"ricorrenza", "ricorrenze", "recurrence", "recurrences", "ricorrenti", "ricorrente", "recurring"}
 
     params = parse_natural_period_values(lowered)
     wants_all_categories = contains_any(lowered, all_words) and contains_any(lowered, category_words)
 
-    # --- Receipt preamble (highest priority) ---
     if contains_any(lowered, receipt_words) and contains_any(lowered, send_words):
         return {"intent": "clarify", "confidence": 0.98, "reply": "", "source_text": text, "params": {}}
+
+    if contains_any(lowered, graph_words) and contains_any(lowered, budget_words):
+        return {"intent": "graph_budget", "confidence": 0.9, "reply": "", "source_text": text, "params": {**params}}
+
+    if contains_any(lowered, graph_words) and contains_any(lowered, recurrence_words):
+        return {"intent": "graph_recurrences", "confidence": 0.9, "reply": "", "source_text": text, "params": {}}
+
+    if contains_any(lowered, recurrence_words) and any(
+        w in lowered for w in {"mostra", "lista", "list", "show", "elenca", "vedi", "fammi vedere", "quali"}
+    ):
+        return {"intent": "list_recurrences", "confidence": 0.88, "reply": "", "source_text": text, "params": {}}
+
+    create_recurrence_words = {
+        "add recurring", "create recurring", "schedule recurring",
+        "aggiungi ricorrente", "crea ricorrenza", "imposta ricorrenza",
+        "add a recurring", "add a monthly recurring", "add monthly", "add weekly", "add yearly",
+        "crea una ricorrenza",
+        "aggiungi una spesa ricorrente", "aggiungi un'entrata ricorrente",
+    }
+    delete_recurrence_words = {
+        "delete recurring", "remove recurring", "cancel recurring",
+        "elimina ricorrenza", "rimuovi ricorrenza", "cancella ricorrenza",
+    }
+    if any(phrase in lowered for phrase in create_recurrence_words):
+        cadence = extract_recurrence(lowered)
+        amount = parse_amount_from_text(lowered)
+        if cadence and amount:
+            income_signals = {"income", "salary", "stipendio", "entrata", "guadagno"}
+            tx_kind = "deposit" if any(signal in lowered for signal in income_signals) else "withdrawal"
+            description_match = re.search(r'\b(?:for|per)\s+([^\W\d_][\w _-]{1,40})', lowered)
+            description = clean_free_text_slot(description_match.group(1)) if description_match else None
+            return {
+                "intent": "create_recurrence",
+                "confidence": 0.85,
+                "reply": "",
+                "source_text": text,
+                "params": {
+                    "cadence": cadence,
+                    "amount": str(amount),
+                    "description": description or "",
+                    "title": description or "",
+                    "transaction_kind": tx_kind,
+                    **params,
+                },
+            }
+
+    if any(phrase in lowered for phrase in delete_recurrence_words):
+        pass
 
     comparison_periods = parse_compare_period_params(text)
     if comparison_periods is not None:
         left_period, right_period = comparison_periods
         metric = "summary"
-        has_income_cmp = contains_any(lowered, income_words) or "entrate" in lowered
-        has_spending_cmp = any(word in lowered for word in spending_side_words) or "uscite" in lowered
         if contains_any(lowered, category_words):
             metric = "top_spending_categories"
-        elif has_income_cmp and has_spending_cmp:
+        elif contains_any(lowered, income_words) and any(word in lowered for word in {"spes", "spend", "uscite", "outgoing"}):
             metric = "income_vs_spending"
         elif contains_any(lowered, spending_words):
             metric = "spending_total"
@@ -116,26 +165,9 @@ def parse_natural_intent_payload(text: str) -> dict[str, Any] | None:
             },
         }
 
-    # --- Income vs Spending ---
-    has_income_signal = contains_any(lowered, income_words) or "entrate" in lowered
-    has_spending_signal = any(word in lowered for word in spending_side_words) or "uscite" in lowered
-    if has_income_signal and has_spending_signal:
+    if contains_any(lowered, income_words) and any(word in lowered for word in {"spes", "spend", "uscite", "outgoing", "entrate", "income", "earned", "guadagn"}):
         return {"intent": "get_income_vs_spending", "confidence": 0.95, "reply": "", "source_text": text, "params": {**params}}
 
-    if contains_any(lowered, cashflow_words) and not contains_any(lowered, graph_words):
-        if "entrate" in lowered and "uscite" in lowered:
-            return {"intent": "get_income_vs_spending", "confidence": 0.93, "reply": "", "source_text": text, "params": {**params}}
-
-    # --- Recent queries (before category checks) ---
-    if contains_any(lowered, recent_words):
-        query = extract_recent_query(text)
-        if query or params or "recent" in lowered or "recenti" in lowered:
-            payload_params = {**params}
-            if query:
-                payload_params["query"] = query
-            return {"intent": "get_recent", "confidence": 0.86, "reply": "", "source_text": text, "params": payload_params}
-
-    # --- Category queries ---
     if contains_any(lowered, category_words) and contains_any(lowered, top_words):
         return {
             "intent": "top_spending_categories",
@@ -145,8 +177,7 @@ def parse_natural_intent_payload(text: str) -> dict[str, Any] | None:
             "params": {**params, "with_graph": contains_any(lowered, graph_words), "all_categories": wants_all_categories},
         }
 
-    # "categorie di marzo 2026"
-    if contains_any(lowered, category_words) and params:
+    if params and contains_any(lowered, category_words):
         return {
             "intent": "top_spending_categories",
             "confidence": 0.88,
@@ -174,18 +205,44 @@ def parse_natural_intent_payload(text: str) -> dict[str, Any] | None:
     if contains_any(lowered, graph_words) and ("spes" in lowered or "spend" in lowered):
         return {"intent": "graph_spending", "confidence": 0.9, "reply": "", "source_text": text, "params": {**params}}
 
-    # --- Spending total ---
     if contains_any(lowered, spending_words) and not any(word in lowered for word in {"add expense", "expense ", "spesa ", "paid ", "pagato", "comprato", "bought"}):
         return {"intent": "get_spending_total", "confidence": 0.9, "reply": "", "source_text": text, "params": {**params}}
 
-    # --- Summary ---
     if contains_any(lowered, summary_words):
         return {"intent": "get_summary", "confidence": 0.8, "reply": "", "source_text": text, "params": {**params}}
 
+    if contains_any(lowered, recent_words):
+        query = extract_recent_query(text)
+        if query or params or "recent" in lowered or "recenti" in lowered:
+            payload_params = {**params}
+            if query:
+                payload_params["query"] = query
+            return {"intent": "get_recent", "confidence": 0.86, "reply": "", "source_text": text, "params": payload_params}
+
+    # --- Budget set detection ---
+    budget_set_words = {
+        "set", "imposta", "fissa", "aggiorna", "limit", "limite", "cap",
+        "increase", "raise", "bump",
+        "lower", "reduce", "decrease", "cut",
+        "aumenta", "aumentare", "alza", "abbassa", "riduci", "diminuisci",
+    }
+    if contains_any(lowered, budget_set_words) and "budget" in lowered:
+        amount = parse_amount_from_text(lowered)
+        budget_name_match = re.search(r'budget\s+["\']?([^\W\d_][\w _-]{1,40}?)["\']?\s+(?:a|to|at|=|\s)', lowered)
+        budget_name = clean_free_text_slot(budget_name_match.group(1)) if budget_name_match else None
+        if amount:
+            return {
+                "intent": "set_budget_limit",
+                "confidence": 0.82,
+                "reply": "",
+                "source_text": text,
+                "params": {**params, "budget_name": budget_name, "amount": amount},
+            }
+
     # --- List commands ---
+    list_trigger_words = {"lista", "list", "mostra", "elenca", "show", "fammi vedere", "quali sono", "dimmi", "i miei", "my"}
     budget_list_words = {"budget", "budgets"}
     account_list_words = {"conto", "conti", "account", "accounts"}
-    category_list_words = category_words
 
     if contains_any(lowered, list_trigger_words) and contains_any(lowered, budget_list_words):
         return {"intent": "list_budgets", "confidence": 0.88, "reply": "", "source_text": text, "params": {}}
@@ -193,8 +250,87 @@ def parse_natural_intent_payload(text: str) -> dict[str, Any] | None:
     if contains_any(lowered, list_trigger_words) and contains_any(lowered, account_list_words):
         return {"intent": "list_accounts", "confidence": 0.88, "reply": "", "source_text": text, "params": {}}
 
-    if contains_any(lowered, list_trigger_words) and contains_any(lowered, category_list_words):
+    if contains_any(lowered, list_trigger_words) and contains_any(lowered, category_words):
         return {"intent": "list_categories", "confidence": 0.88, "reply": "", "source_text": text, "params": {}}
+
+    # --- Transfer detection ---
+    transfer_words = {"transfer", "trasferimento", "trasferisci", "trasferire", "move", "sposta", "gira", "manda"}
+    from_to_en = re.search(r'\bfrom\s+([^\W\d_][\w _-]{1,50}?)\s+to\s+([^\W\d_][\w _-]{1,50})(?:\s|$)', lowered)
+    from_to_it = re.search(r'\bda\s+([^\W\d_][\w _-]{1,50}?)\s+(?:a|al|alla|nel)\s+([^\W\d_][\w _-]{1,50})(?:\s|$)', lowered)
+    from_to = from_to_en or from_to_it
+    if contains_any(lowered, transfer_words) and from_to:
+        src = clean_free_text_slot(from_to.group(1)) or from_to.group(1).strip()
+        dst = clean_free_text_slot(from_to.group(2)) or from_to.group(2).strip()
+        return {
+            "intent": "create_transfer",
+            "confidence": 0.88,
+            "reply": "",
+            "source_text": text,
+            "params": {
+                "amount": parse_amount_from_text(lowered),
+                "source": src,
+                "destination": dst,
+                "description": f"{src} â†’ {dst}",
+            },
+        }
+    if contains_any(lowered, transfer_words):
+        amount = parse_amount_from_text(lowered)
+        if amount:
+            source_match = re.search(r'\bfrom\s+([^\W\d_][\w _-]{1,50})(?:\s|$)', lowered) or re.search(
+                r'\bda\s+([^\W\d_][\w _-]{1,50})(?:\s|$)',
+                lowered,
+            )
+            destination_match = re.search(r'\bto\s+([^\W\d_][\w _-]{1,50})(?:\s|$)', lowered) or re.search(
+                r'\b(?:a|al|alla|nel)\s+([^\W\d_][\w _-]{1,50})(?:\s|$)',
+                lowered,
+            )
+            source = (clean_free_text_slot(source_match.group(1)) or source_match.group(1).strip()) if source_match else None
+            destination = (clean_free_text_slot(destination_match.group(1)) or destination_match.group(1).strip()) if destination_match else None
+            if source and destination:
+                description = f"{source} -> {destination}"
+            elif source:
+                description = f"Transfer from {source}"
+            elif destination:
+                description = f"Transfer to {destination}"
+            else:
+                description = "Transfer"
+            return {
+                "intent": "create_transfer",
+                "confidence": 0.82,
+                "reply": "",
+                "source_text": text,
+                "params": {
+                    "amount": amount,
+                    "source": source or "",
+                    "destination": destination or "",
+                    "description": description,
+                },
+            }
+
+    # --- Budget report detection ---
+    budget_report_words = {"budgetreport", "reportbudget", "report budget", "budget report"}
+    if any(phrase in lowered for phrase in budget_report_words):
+        return {
+            "intent": "budget_report",
+            "confidence": 0.85,
+            "reply": "",
+            "source_text": text,
+            "params": {**params},
+        }
+
+    # --- Search / find transaction detection ---
+    find_words = {"trova", "cerca", "find", "look for"}
+    if any(word in lowered for word in find_words):
+        search_match = re.search(r'\b(?:trova|cerca|find|look\s+for)\s+(.+)', lowered)
+        query = clean_free_text_slot(search_match.group(1)) if search_match else None
+        if query:
+            return {
+                "intent": "search_transactions",
+                "confidence": 0.80,
+                "reply": "",
+                "source_text": text,
+                "params": {"query": query, **params},
+            }
 
     return None
 
@@ -245,13 +381,13 @@ def extract_recurrence(text: str) -> str | None:
     """
     lowered = normalize_natural_text(text)
 
-    if any(w in lowered for w in ["daily", "ogni giorno", "day", "al giorno"]):
+    if any(w in lowered for w in ["daily", "ogni giorno", "day", "al giorno", "giornaliero", "giornaliera"]):
         return "daily"
-    elif any(w in lowered for w in ["weekly", "ogni settimana", "week", "a settimana"]):
+    elif any(w in lowered for w in ["weekly", "ogni settimana", "week", "a settimana", "settimanale"]):
         return "weekly"
-    elif any(w in lowered for w in ["monthly", "ogni mese", "every month", "month", "al mese"]):
+    elif any(w in lowered for w in ["monthly", "ogni mese", "every month", "month", "al mese", "mensile"]):
         return "monthly"
-    elif any(w in lowered for w in ["yearly", "ogni anno", "year", "annual", "annuale", "annualmente"]):
+    elif any(w in lowered for w in ["yearly", "ogni anno", "year", "annual", "annuale", "annualmente", "annuale"]):
         return "yearly"
 
     return None

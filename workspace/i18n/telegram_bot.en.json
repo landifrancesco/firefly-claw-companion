@@ -34,7 +34,17 @@
     "draft_correction_hint": "You can also say: 'change amount to X', 'change category', 're-read'.",
     "draft_no_category": "I couldn't determine a category. Which one should I use? (type a name, or 'skip')",
     "receipt_counting": "I found {count} transactions in the image.",
-    "receipt_amount_unreadable": "I can't read the amount. Can you tell me?"
+    "receipt_amount_unreadable": "I can't read the amount. Can you tell me?",
+    "withdraw_draft_title": "ATM withdrawal draft:",
+    "transfer_missing_source": "I need the account to transfer from.",
+    "transfer_missing_destination": "I need the account to transfer to.",
+    "budget_remaining_label": "Budget remaining: {amount}",
+    "recurrence_cadence_label": "Frequency: {cadence}",
+    "router_down_warning": "Router down. Try /help or a direct command.",
+    "income_no_source": "Income recorded without a source account (revenue side). Add one via /train if needed.",
+    "amount_missing": "I still need the amount. Example: add an expense of 12.50 for lunch.",
+    "search_no_results": "No transactions found matching \"{query}\".",
+    "search_results_title": "Transactions matching \"{query}\":"
   },
   "lists": {
     "command_lines": [

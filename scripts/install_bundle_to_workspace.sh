@@ -22,7 +22,7 @@ copy_if_absent() {
 }
 
 copy_if_absent "${SOURCE_ROOT}/config/mappings.yml.example" "${TARGET_ROOT}/config/mappings.yml"
-copy_if_absent "${SOURCE_ROOT}/config/policy.yml" "${TARGET_ROOT}/config/policy.yml"
+copy_if_absent "${SOURCE_ROOT}/config/policy.yml.example" "${TARGET_ROOT}/config/policy.yml"
 copy_if_absent "${SOURCE_ROOT}/config/policy.yml.example" "${TARGET_ROOT}/config/policy.yml.example"
 copy_if_absent "${SOURCE_ROOT}/i18n/telegram_bot.en.json" "${TARGET_ROOT}/i18n/telegram_bot.en.json"
 copy_if_absent "${SOURCE_ROOT}/i18n/telegram_bot.it.json" "${TARGET_ROOT}/i18n/telegram_bot.it.json"

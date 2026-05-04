@@ -32,6 +32,7 @@ Thumbs.db
 dist/
 build/
 openclaw_home/
+picoclaw_home/
 workspace/logs/*
 !workspace/logs/.gitkeep
 workspace/config/mappings.yml

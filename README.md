@@ -1,210 +1,585 @@
-# firefly-openclaw-companion
+# firefly-claw-companion
 
-`firefly-openclaw-companion` is a Docker-first companion for Firefly III.
-It runs beside Firefly III, talks only through the REST API, and provides a
-Telegram-first workflow for balances, summaries, recent transactions, and safe
-transaction creation.
+![firefly-claw-companion](docs/assets/firefly_claw_companion.png)
 
-## What this project does
+A Telegram bot companion for [Firefly III](https://www.firefly-iii.org/) that understands plain language. You can ask things like "how much did I spend on food last month" or "add an expense of 12 euros for coffee" and it will handle it. Write operations are dry-run by default so nothing gets saved until you confirm.
 
-- Connects to an existing Firefly III instance.
-- Runs OpenClaw in an isolated companion container.
-- Starts a dedicated Telegram bot for finance operations.
-- Keeps write operations conservative with dry-run defaults and confirmation gates.
-- Supports receipt/screenshot parsing with local OCR and optional AI OCR assistance.
+**Repository:** https://github.com/landifrancesco/firefly-claw-companion
 
-## Repository layout
+---
 
-- `docker-compose.yml`: main runtime stack (`companion` + optional `setup` profile).
-- `docker/entrypoint.sh`: runtime bootstrap, secrets loading, startup checks.
-- `scripts/setup_wizard.py`: guided local setup that writes `.env` and token files.
-- `src/firefly_companion/`: Firefly API client, bridge logic, CLI commands.
-- `workspace/config/mappings.yml.example`: starter aliases/mapping template.
-- `workspace/config/policy.yml.example`: starter runtime safety policy template.
-- `docs/INSTALL.md`: extended install/reference documentation.
+## What it does
+
+- Connects to your existing Firefly III instance through its REST API.
+- Runs a Telegram bot that accepts both natural language and slash commands.
+- Parses receipts and bank screenshots with OCR and optional AI vision.
+- Keeps all write operations behind a confirmation step, with duplicate detection and high-value thresholds.
+- Supports English and Italian out of the box, with a modular translation system that lets you add any language by dropping a single JSON file.
+
+## How the natural language works
+
+When you send a message, the bot tries three things in order:
+
+1. A fast deterministic parser that handles common patterns without calling any AI.
+2. If that fails, it calls your configured AI model (Gemini, GPT, Claude, etc.) to interpret the intent.
+3. If the AI is unavailable, a regex fallback handles the most explicit transaction sentences.
+
+This means most everyday requests work instantly and cheaply, and the AI is only called when the request is genuinely ambiguous.
+
+---
 
 ## Prerequisites
 
-Before starting, make sure you have:
+You need these four things before you start:
 
-1. Docker Desktop (or Docker Engine) with Compose enabled.
-2. A reachable Firefly III instance (local or remote).
-3. A Firefly III personal access token.
-4. A Telegram bot token.
-5. At least one supported model provider credential (for OpenClaw).
+1. **Docker** with Compose support (Docker Desktop on Mac/Windows, or Docker Engine + the compose plugin on Linux).
+2. A running **Firefly III** instance, reachable over HTTP or HTTPS from your server.
+3. A **Firefly III personal access token** (see below).
+4. A **Telegram bot token** and your **Telegram user ID** (see below).
+5. An **AI provider API key** for at least one provider (see below). The bot uses Google Gemini by default because it has a generous free tier.
 
-## Step-by-step setup
+---
 
-### Step 1 - Clone and enter the project
+## Getting your API keys and tokens
 
-```bash
-git clone <your-fork-or-repo-url> firefly-openclaw-companion
-cd firefly-openclaw-companion
+### Firefly III personal access token
+
+1. Log into your Firefly III instance and go to `https://firefly.example.com/profile/oauth` (replace `firefly.example.com` with your actual domain or IP).
+2. Scroll down to **Personal Access Tokens** and click **Create new token**.
+3. Give it a name like "companion" and leave the expiry empty if you want it to last indefinitely.
+4. Copy the token immediately. You will not see it again after you close that page.
+
+If you are running Firefly III locally with the default Docker setup, the URL is `http://localhost:8080` and the OAuth page is at `http://localhost:8080/profile/oauth`.
+
+### Telegram bot token
+
+1. Open Telegram and search for **@BotFather**.
+2. Send `/newbot` and follow the prompts. Pick any name and username.
+3. BotFather will give you a token that looks like `7123456789:AABBcc...`. Copy it.
+
+### Your Telegram user ID
+
+The bot only accepts messages from your account. You need your numeric Telegram user ID.
+
+1. Open Telegram and search for **@userinfobot** (or **@getidsbot**).
+2. Send `/start` or any message.
+3. It replies with your numeric ID, something like `123456789`.
+
+Both `TELEGRAM_OWNER_ID` and `TELEGRAM_TARGET_ID` in the config usually get set to this same number unless you want the bot to send startup messages to a different chat.
+
+### AI provider API key
+
+Pick one provider. The bot uses Google Gemini by default because Gemini 2.5 Flash has a free tier that is enough for personal use.
+
+| Provider | Where to get the key | Env variable |
+|---|---|---|
+| **Google Gemini** (default) | [aistudio.google.com/apikey](https://aistudio.google.com/apikey) | `GOOGLE_API_KEY` |
+| OpenAI | [platform.openai.com/api-keys](https://platform.openai.com/api-keys) | `OPENAI_API_KEY` |
+| Anthropic | [console.anthropic.com/settings/keys](https://console.anthropic.com/settings/keys) | `ANTHROPIC_API_KEY` |
+| OpenRouter | [openrouter.ai/settings/keys](https://openrouter.ai/settings/keys) | `OPENROUTER_API_KEY` |
+| Groq | [console.groq.com/keys](https://console.groq.com/keys) | `GROQ_API_KEY` |
+
+To switch from the default Gemini to another provider, set `PICOCLAW_DEFAULT_MODEL` in your `.env`:
+
+```env
+# Examples:
+PICOCLAW_DEFAULT_MODEL=gemini/gemini-2.5-flash         # default
+PICOCLAW_DEFAULT_MODEL=openai/gpt-4o-mini
+PICOCLAW_DEFAULT_MODEL=anthropic/claude-haiku-4-5-20251001
+PICOCLAW_DEFAULT_MODEL=groq/llama-3.1-8b-instant
+PICOCLAW_DEFAULT_MODEL=openrouter/google/gemini-flash-1.5
 ```
 
-**What these commands do**
-- `git clone ...`: downloads the repository to your machine.
-- `cd firefly-openclaw-companion`: enters the project folder.
+### Optional: PDF and image OCR key
 
-### Step 2 - Run the setup wizard (recommended)
+If you want to send PDF bank statements or higher-quality receipt parsing, you can set a `PDFAPIHUB_API_KEY`. This is completely optional. The bot falls back to local Tesseract OCR if no key is provided.
+
+Get a key at [pdfapihub.com](https://pdfapihub.com).
+
+---
+
+## Setup
+
+### Option A: Setup wizard (recommended)
+
+The wizard asks you questions and writes all the config files for you.
 
 ```bash
+git clone https://github.com/landifrancesco/firefly-claw-companion
+cd firefly-claw-companion
 docker compose --profile setup run --rm setup
+docker compose up -d --build
 ```
 
-**What this command does**
-- Starts the interactive setup container once.
-- Generates local runtime files such as:
-  - `.env`
-  - `secrets/firefly_access_token.txt`
-  - `secrets/openclaw_gateway_token.txt`
-  - `secrets/telegram_bot_token.txt`
-- Can validate connectivity and send a Telegram test message.
-- `--rm` removes the temporary setup container after completion.
-- Defaults to connecting to Firefly III through a normal URL or HTTPS domain.
-  The wizard keeps `FIREFLY_DOCKER_NETWORK_EXTERNAL=false` unless you explicitly
-  choose the advanced Docker-network mode.
+The wizard will ask for your Firefly URL, personal access token, Telegram bot token, Telegram user ID, and AI provider key. It writes `.env`, `secrets/firefly_access_token.txt`, and `secrets/telegram_bot_token.txt`.
 
-### Step 3 - Start the companion stack
+### Option B: Manual setup
+
+Copy the example files and edit them:
+
+```bash
+git clone https://github.com/landifrancesco/firefly-claw-companion
+cd firefly-claw-companion
+
+cp .env.example .env
+
+mkdir -p secrets
+printf '%s' 'your-firefly-token-here' > secrets/firefly_access_token.txt
+printf '%s' 'your-telegram-bot-token-here' > secrets/telegram_bot_token.txt
+chmod 600 secrets/*.txt
+```
+
+Then open `.env` and fill in the required fields:
+
+```env
+FIREFLY_BASE_URL=https://firefly.example.com
+
+TELEGRAM_OWNER_ID=123456789
+TELEGRAM_TARGET_ID=123456789
+
+GOOGLE_API_KEY=your-google-api-key-here
+# or whichever provider you chose
+```
+
+Then start the stack:
 
 ```bash
 docker compose up -d --build
 ```
 
-**What this command does**
-- `--build`: builds the image if required (or if sources changed).
-- `-d`: runs the services in detached/background mode.
-- Starts the main `companion` service from `docker-compose.yml`.
+---
 
-## Firefly connection and Docker networks
+## Connecting to Firefly III
 
-The companion only talks to Firefly III through the REST API. It does not need
-database access or shared volumes.
+### Standard setup (recommended)
 
-Recommended setup:
+This works for most people. Firefly III is reachable through a URL from your server or Docker host:
 
 ```env
 FIREFLY_BASE_URL=https://firefly.example.com
 FIREFLY_DOCKER_NETWORK_EXTERNAL=false
 ```
 
-Use this when Firefly III is reachable through a domain, HTTPS reverse proxy, or
-any URL the companion container can call. With `FIREFLY_DOCKER_NETWORK_EXTERNAL=false`,
-Docker Compose creates this app's own network automatically. This is the default
-and avoids startup failures on a fresh VPS.
+With `FIREFLY_DOCKER_NETWORK_EXTERNAL=false`, Docker Compose creates a private network for this app automatically. No manual network setup needed.
 
-Advanced internal Docker setup:
+### Advanced: same Docker host as Firefly III
+
+If Firefly III is already running in a separate Compose stack on the same machine and you want the companion to talk to it directly over an internal Docker network (no internet hop, no TLS needed):
 
 ```env
-FIREFLY_DOCKER_NETWORK=<existing-firefly-network>
+FIREFLY_DOCKER_NETWORK=firefly_firefly       # the network name from the Firefly stack
 FIREFLY_DOCKER_NETWORK_EXTERNAL=true
-FIREFLY_BASE_URL=http://<firefly-container-name>:8080
+FIREFLY_BASE_URL=http://firefly_iii_core:8080
 ```
 
-Use this only when Firefly III is already running in another Compose stack and
-you want direct container-to-container traffic. In this mode Compose expects the
-network to already exist and will fail with `network ... declared as external,
-but could not be found` if the name is wrong or the network has not been created.
-
-To find the network used by an existing Firefly container:
+To find the network name used by your existing Firefly container:
 
 ```bash
 docker inspect -f '{{range $name, $_ := .NetworkSettings.Networks}}{{println $name}}{{end}}' firefly_iii_core
 ```
 
-### Step 4 - Verify startup and health
+Use the exact name it prints. If the name is wrong, startup will fail with `network ... declared as external, but could not be found`.
+
+---
+
+## Verification
+
+After starting, check everything is working:
 
 ```bash
+# Check container status
 docker compose ps
+
+# Follow logs in real time
 docker compose logs -f companion
+
+# Test the Firefly API connection
 docker compose exec companion python3 -m firefly_companion.cli health
-```
 
-**What these commands do**
-- `docker compose ps`: shows container status (`running`, `healthy`, etc.).
-- `docker compose logs -f companion`: follows companion logs in real time.
-- `... cli health`: runs an application-level Firefly API health check.
-
-### Step 5 - Run your first read-only checks
-
-```bash
+# List your accounts
 docker compose exec companion python3 -m firefly_companion.cli accounts list --type asset
-docker compose exec companion python3 -m firefly_companion.cli summary month
-docker compose exec companion python3 -m firefly_companion.cli transactions search --days 7
 ```
 
-**What these commands do**
-- `accounts list --type asset`: lists asset accounts from Firefly.
-- `summary month`: prints current month financial summary.
-- `transactions search --days 7`: lists recent transactions in the last 7 days.
+Then open Telegram, find your bot, and send `/start`. It should reply with a welcome message and prompt you to run a short training flow that teaches it your default accounts.
 
-## If normal startup is flaky
+---
 
-Use a strict rebuild path:
+## What you can ask
+
+Send any message to your bot. Here are examples of things that work:
+
+### Balances and summaries
+
+```
+how much money do i have
+show me my accounts
+show my summary for this month
+show my summary for last month
+show my summary from 01-04-2026 to 15-04-2026
+```
+
+### Spending queries
+
+```
+how much did i spend this month
+how much did i spend on food last month
+income vs spending for march
+income vs spending from 01-03-2026 to 31-03-2026
+```
+
+### Adding expenses
+
+```
+add an expense of 12 euros for coffee
+paid 8.50 for lunch
+add expense €45 at the pharmacy paid with card
+bought groceries for 32 euros
+```
+
+### Adding income
+
+```
+received salary 2200 this month
+income 500 from freelance work
+add income of 1800 for salary
+```
+
+### Transfers between accounts
+
+```
+transfer 200 from checking to savings
+move 500 from main account to emergency fund
+transfer €100 from wallet to card
+```
+
+### ATM withdrawals
+
+```
+withdraw 50 euros from ATM
+withdrew €100 at the ATM
+withdrawal of 80 euros
+```
+
+### Graphs and charts
+
+```
+make a graph of my balances
+show me a spending chart for last month
+cashflow chart for this month
+make a graph of my budget usage
+top categories chart for march
+```
+
+### Categories
+
+```
+show me the categories i spent the most on this month
+top categories for last month with a graph
+show all categories for march
+```
+
+### Budgets
+
+```
+show my budgets
+how much is left in my groceries budget
+set groceries budget to 350 this month
+increase food budget by 50
+lower transport budget to 100
+```
+
+### Recurring transactions
+
+```
+add a monthly recurring expense of 80 for rent
+add a yearly recurring expense of 120 for netflix
+show my recurring transactions
+```
+
+### Receipts and bank screenshots
+
+Send a photo of a receipt or a bank app screenshot directly to the chat. The bot will try to read it with OCR and prepare a draft. You can add a caption like "receipt for coffee paid with card" to help it understand the context.
+
+### Searching past transactions
+
+```
+find coffee
+search for amazon
+search for pharmacy last month
+```
+
+---
+
+## Slash commands
+
+You can also use explicit slash commands if you prefer:
+
+```
+/help              - natural language examples
+/commands          - full command list
+/balances          - account balances
+/summary           - monthly summary (add month=2026-04 for a specific month)
+/recent            - recent transactions (add days=30 or a date range)
+/topcategories     - top spending categories
+/budgetreport      - budget usage report
+/graph             - balance, spending, or cashflow chart
+/expense           - add an expense draft
+/income            - add an income draft
+/transfer          - add a transfer draft
+/recurrences       - list recurring transactions
+/search <keyword>  - search recent transactions
+/backup            - download a JSON backup of your Firefly data
+/setup             - view or reset your finance profile
+/train             - re-run the account defaults training
+/add               - guided step-by-step transaction entry
+/undo              - restore the last cancelled draft
+```
+
+Italian equivalents are also available: `/saldi`, `/riepilogo`, `/recenti`, `/spesa`, `/entrata`, `/trasferimento`, `/budget`, `/ricorrenze`, `/cerca`, and so on.
+
+---
+
+## Adding a language
+
+English and Italian are included out of the box. The bot detects the language automatically from what you write. If you want to add French, German, Spanish, or any other language, you only need to create one file.
+
+All UI strings live in `workspace/i18n/`. The naming convention is `telegram_bot.{language-code}.json`. So for French you would create `workspace/i18n/telegram_bot.fr.json`.
+
+Start by copying the English file as a base:
 
 ```bash
-docker compose build --no-cache companion
-docker compose up -d --force-recreate companion
+cp workspace/i18n/telegram_bot.en.json workspace/i18n/telegram_bot.fr.json
 ```
 
-**What these commands do**
-- `build --no-cache`: rebuilds the companion image from scratch.
-- `up ... --force-recreate`: recreates the container even if config seems unchanged.
+Then open `telegram_bot.fr.json` and translate the values inside the `"strings"` and `"lists"` objects. Do not change the keys, only the values. For example:
 
-## Local-only files (not committed)
+```json
+{
+  "strings": {
+    "help_title": "Je peux vous aider avec Firefly en langage naturel.",
+    "draft_committed": "Transaction enregistree avec succes.",
+    "draft_discarded": "Brouillon annule.",
+    ...
+  },
+  "lists": {
+    "help_natural_examples": [
+      "combien d'argent ai-je",
+      "montre-moi mon resume du mois",
+      ...
+    ]
+  }
+}
+```
 
-These files are intentionally local and ignored by Git:
+Then set the language in your `.env` so the bot uses it:
 
-- `.env`
-- `secrets/` token files
-- `workspace/config/mappings.yml`
-- `workspace/config/policy.yml`
-- `workspace/logs/`
+```env
+FIREFLY_CHAT_LANGUAGE=fr
+```
 
-Safe templates to commit:
+Or leave it as `auto` if you want the bot to detect the language per message. Detection for languages other than English and Italian is handled by the AI router, which understands most major languages regardless of the UI file.
 
-- `.env.example`
-- `workspace/config/mappings.yml.example`
-- `workspace/config/policy.yml.example`
-
-## Command reference (quick)
-
-### Docker lifecycle
-
-- `docker compose --profile setup run --rm setup`: run interactive setup wizard.
-- `docker compose up -d --build`: build (if needed) and start in background.
-- `docker compose down`: stop and remove containers from this compose project.
-- `docker compose restart companion`: restart only the companion service.
-- `docker compose logs -f companion`: stream live logs for troubleshooting.
-
-### Companion CLI
-
-- `python3 -m firefly_companion.cli health`: API/runtime health check.
-- `python3 -m firefly_companion.cli accounts list --type asset`: list asset accounts.
-- `python3 -m firefly_companion.cli accounts balances`: show account balances.
-- `python3 -m firefly_companion.cli categories list`: list Firefly categories.
-- `python3 -m firefly_companion.cli budgets list`: list budgets.
-- `python3 -m firefly_companion.cli summary month --month YYYY-MM`: month summary.
-- `python3 -m firefly_companion.cli transactions search --days 7 --query groceries`: filtered search.
-
-Run any CLI command inside the container with:
+Restart after adding the file:
 
 ```bash
-docker compose exec companion <your-command>
+docker compose restart companion
 ```
+
+---
 
 ## Safety defaults
 
-- Write operations default to dry-run mode.
-- High-value transaction confirmation is required above threshold.
-- Delete operations are disabled by default.
-- OpenClaw binds to loopback by default (`OPENCLAW_BIND=loopback`).
+All write operations are dry-run by default. When the bot prepares a transaction it shows you a preview and waits for you to say "ok" or "confirm" before saving anything.
+
+Additional safety features:
+
+- Transactions above `FIREFLY_HIGH_VALUE_THRESHOLD` (default: 250.00) require an extra confirmation.
+- Duplicate detection rejects transactions that look identical to something already saved within `FIREFLY_DEDUPE_WINDOW_DAYS` (default: 7 days).
+- Delete operations are disabled by default. Set `FIREFLY_ALLOW_DELETE=true` to enable them.
+
+To commit a write for real in a single command without the review step, add `live=yes` to your message. Example: `add expense €12 for coffee live=yes`.
+
+---
+
+## Mapping and policy files
+
+After the first run, two config files appear in `workspace/config/`. You can edit them to teach the bot your account structure:
+
+**`workspace/config/mappings.yml`** - account defaults and merchant rules:
+
+```yaml
+defaults:
+  expense_source_account: Main Checking
+  expense_destination_account: Misc Expenses
+  income_source_account: Income Source
+  income_destination_account: Main Checking
+
+merchant_rules:
+  coop:
+    destination_account: Coop
+    category: Groceries
+  amazon:
+    destination_account: Amazon
+    category: Shopping
+```
+
+**`workspace/config/policy.yml`** - safety thresholds:
+
+```yaml
+writes:
+  default_dry_run: true
+  high_value_threshold: "250.00"
+  dedupe_window_days: 7
+  allow_delete: false
+```
+
+After editing either file, restart the companion:
+
+```bash
+docker compose restart companion
+```
+
+---
+
+## Environment variables reference
+
+These are the variables you are most likely to need. Copy `.env.example` to `.env` as a starting point.
+
+| Variable | Required | Description |
+|---|---|---|
+| `FIREFLY_BASE_URL` | Yes | Full URL to your Firefly III instance |
+| `TELEGRAM_OWNER_ID` | Yes | Your numeric Telegram user ID |
+| `TELEGRAM_TARGET_ID` | Yes | Chat ID where the bot sends startup messages (usually same as owner) |
+| `GOOGLE_API_KEY` | Yes (or another provider) | Google AI Studio API key for Gemini |
+| `OPENAI_API_KEY` | Optional | OpenAI API key |
+| `ANTHROPIC_API_KEY` | Optional | Anthropic API key |
+| `OPENROUTER_API_KEY` | Optional | OpenRouter API key |
+| `GROQ_API_KEY` | Optional | Groq API key |
+| `PICOCLAW_DEFAULT_MODEL` | Optional | Override the AI model, e.g. `openai/gpt-4o-mini` |
+| `FIREFLY_CHAT_LANGUAGE` | Optional | Force language: `en`, `it`, or `auto` (default) |
+| `FIREFLY_DEFAULT_DRY_RUN` | Optional | Set to `false` to skip dry-run globally (not recommended) |
+| `FIREFLY_HIGH_VALUE_THRESHOLD` | Optional | Amount above which extra confirmation is required (default: `250.00`) |
+| `FIREFLY_ALLOW_DELETE` | Optional | Set to `true` to allow delete operations |
+| `PDFAPIHUB_API_KEY` | Optional | API key for enhanced PDF/image OCR |
+| `TZ` | Optional | Timezone for the container, e.g. `Europe/Rome` |
+
+Firefly credentials and the Telegram token are read from files in `secrets/`, not directly from `.env`:
+
+```
+secrets/firefly_access_token.txt    - your Firefly III personal access token
+secrets/telegram_bot_token.txt      - your Telegram bot token
+```
+
+---
+
+## Token rotation
+
+To update a token without going through setup again:
+
+```bash
+printf '%s' 'new-firefly-token' > secrets/firefly_access_token.txt
+printf '%s' 'new-telegram-token' > secrets/telegram_bot_token.txt
+chmod 600 secrets/*.txt
+docker compose restart companion
+```
+
+The entrypoint rewrites the internal config files on every restart, so the new tokens are picked up automatically.
+
+---
+
+## Running the companion next to a test Firefly instance
+
+If you want to run everything locally for testing and do not have a Firefly III instance yet:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.example-firefly.yml --profile example-firefly up -d --build
+```
+
+This starts a local Firefly III at `http://127.0.0.1:8080`. Finish the Firefly setup in your browser, create a personal access token from the profile menu, save it to `secrets/firefly_access_token.txt`, then restart the companion:
+
+```bash
+docker compose restart companion
+```
+
+---
+
+## CLI commands
+
+You can run any operation directly from the command line inside the container:
+
+```bash
+# Health check
+docker compose exec companion python3 -m firefly_companion.cli health
+
+# List accounts
+docker compose exec companion python3 -m firefly_companion.cli accounts list --type asset
+docker compose exec companion python3 -m firefly_companion.cli accounts balances
+
+# Categories and budgets
+docker compose exec companion python3 -m firefly_companion.cli categories list
+docker compose exec companion python3 -m firefly_companion.cli budgets list
+
+# Summaries and transactions
+docker compose exec companion python3 -m firefly_companion.cli summary month --month 2026-04
+docker compose exec companion python3 -m firefly_companion.cli transactions search --days 7 --query groceries
+
+# Dry-run expense
+docker compose exec companion python3 -m firefly_companion.cli expense dry-run \
+  --amount 42.50 \
+  --description "Groceries" \
+  --merchant coop
+```
+
+---
 
 ## Troubleshooting
 
-- `HTTP 401` from Firefly: token is invalid, expired, or for the wrong user.
-- Telegram setup fails: verify bot token and numeric owner/target IDs.
-- Service stays unhealthy: inspect `docker compose logs -f companion`.
-- OCR quality is weak: review OCR/provider settings in `.env`.
+**The bot does not respond on Telegram.**
+Check that `TELEGRAM_OWNER_ID` matches your actual Telegram user ID. The bot ignores all messages from unknown IDs. Also confirm the bot token is correct with `docker compose logs -f companion`.
 
-For full details and advanced scenarios, see `docs/INSTALL.md`.
+**HTTP 401 from Firefly III.**
+Your personal access token is invalid, expired, or belongs to a different Firefly user. Generate a new one and update `secrets/firefly_access_token.txt`, then restart.
+
+**The container stays unhealthy.**
+Run `docker compose logs --tail=200 companion` to see the startup errors. Common causes: wrong Firefly URL, wrong Docker network name, or the AI provider key is missing.
+
+**OCR on receipts is poor.**
+Add a short text caption to the photo when you send it, like "supermarket receipt paid with card". The bot uses the caption as context. For better results, set `PDFAPIHUB_API_KEY` in your `.env`.
+
+**The bot understood the request but used the wrong account.**
+Run `/train` in the chat to re-configure your default expense and income accounts. You can also edit `workspace/config/mappings.yml` directly and restart.
+
+**I want to debug what the bot is doing.**
+```bash
+docker compose logs -f companion
+docker compose exec companion env | grep FIREFLY_
+docker compose exec companion cat /home/picoclaw/.picoclaw/config.json
+```
+
+---
+
+## Project layout
+
+```
+scripts/telegram_firefly_bot.py     - Telegram bot, NL parser, and intent routing
+src/firefly_companion/              - Firefly API client, AI router, bridge logic
+  ai_router.py                      - direct AI provider calls (Gemini, GPT, Claude, etc.)
+  intent_parser.py                  - deterministic NL parsing
+  conversation.py                   - language detection and i18n
+  client.py                         - Firefly III REST API client
+  bridge.py                         - MCP bridge between PicoClaw and Firefly
+workspace/
+  config/mappings.yml               - account defaults and merchant rules (local)
+  config/policy.yml                 - safety policy (local)
+  i18n/telegram_bot.en.json         - English UI strings
+  i18n/telegram_bot.it.json         - Italian UI strings
+  i18n/telegram_bot.{lang}.json     - add your own language here (e.g. telegram_bot.fr.json)
+docker/entrypoint.sh                - container bootstrap
+.env.example                        - environment variable template
+```
+
+---
+
+## License
+
+See [LICENSE](LICENSE).

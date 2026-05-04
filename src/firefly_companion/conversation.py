@@ -83,12 +83,16 @@ def clean_free_text_slot(value: str | None) -> str | None:
 # Language detection
 # ---------------------------------------------------------------------------
 
-_ITALIAN_MARKERS = (
-    "quanto", "quanti", "soldi", "spesa", "spese", "conto", "conti", "categoria",
-    "categorie", "budget", "ricorren", "mostra", "fammi", "aggiungi", "crea", "saldo",
-    "saldi", "caff", "pagat", "contanti", "entrate", "uscite", "guadagn",
-    "supermercato", "mercato",
-)
+_LANGUAGE_MARKERS: dict[str, tuple[str, ...]] = {
+    "it": (
+        "quanto", "quanti", "soldi", "spesa", "spese", "conto", "conti", "categoria",
+        "categorie", "budget", "ricorren", "mostra", "fammi", "aggiungi", "crea", "saldo",
+        "saldi", "caff", "pagat", "contanti", "entrate", "uscite", "guadagn",
+        "supermercato", "mercato",
+    ),
+    # Add future languages here, for example:
+    # "fr": ("combien", "depenses", "solde", ...),
+}
 
 
 def explicit_language_hint(text: str | None) -> str | None:
@@ -116,8 +120,9 @@ def detect_language(text: str | None) -> str:
     if hinted:
         return hinted
     lowered = (text or "").casefold()
-    if any(marker in lowered for marker in _ITALIAN_MARKERS):
-        return "it"
+    for language, markers in _LANGUAGE_MARKERS.items():
+        if any(marker in lowered for marker in markers):
+            return language
     return "en"
 
 
@@ -212,8 +217,10 @@ def bot_list(key: str, *, source_text: str | None = None) -> list[str]:
 # Localize helper (backward-compatible)
 # ---------------------------------------------------------------------------
 
-def localize(text_en: str, text_it: str, *, source_text: str | None = None) -> str:
-    """Return the Italian or English string based on detected language."""
+def localize(text_en: str, text_it: str | None = None, *, source_text: str | None = None) -> str:
+    """Return localized text from a catalog key or backward-compatible inline strings."""
+    if text_it is None:
+        return bot_text(text_en, source_text=source_text)
     return text_it if locale_language(source_text) == "it" else text_en
 
 

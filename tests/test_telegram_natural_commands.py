@@ -6,7 +6,7 @@ import unittest
 
 os.environ.setdefault("MPLCONFIGDIR", tempfile.mkdtemp(prefix="mplconfig-"))
 
-from scripts.telegram_firefly_bot import interpret_natural_command
+from scripts.telegram_firefly_bot import parse_natural_intent_payload, interpret_natural_command
 from firefly_companion.conversation import clean_free_text_slot
 
 
@@ -36,6 +36,27 @@ class TelegramNaturalCommandTest(unittest.TestCase):
     def test_free_text_cleanup_strips_cash_suffixes(self) -> None:
         self.assertEqual(clean_free_text_slot("bar i ncash"), "bar")
         self.assertEqual(clean_free_text_slot("a coffee made with cash"), "a coffee")
+
+    def test_new_natural_intents_are_detected(self) -> None:
+        cases = [
+            ("trova caffe", "search_transactions"),
+            ("cerca supermercato", "search_transactions"),
+            ("increase my groceries budget by 50 this month", "set_budget_limit"),
+            ("raise food budget to 400 for april", "set_budget_limit"),
+            ("abbassa il budget viaggi di 100", "set_budget_limit"),
+            ("add a monthly recurring expense of €50 for gym", "create_recurrence"),
+            ("crea una ricorrenza mensile di €80 per affitto", "create_recurrence"),
+            ("transfer €100", "create_transfer"),
+            ("transfer €100 to savings", "create_transfer"),
+            ("transfer €100 from checking to savings", "create_transfer"),
+            ("trasferisci 50 euro da cassa a carta", "create_transfer"),
+        ]
+        for text, expected_intent in cases:
+            with self.subTest(text=text):
+                payload = parse_natural_intent_payload(text)
+                self.assertIsNotNone(payload)
+                assert payload is not None
+                self.assertEqual(payload["intent"], expected_intent)
 
 
 if __name__ == "__main__":

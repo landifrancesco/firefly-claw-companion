@@ -28,7 +28,7 @@ else
   [[ -f "${ROOT_DIR}/scripts/setup_wizard.py" ]] || fail "scripts/setup_wizard.py missing"
   [[ -f "${ROOT_DIR}/workspace/tools/firefly-bridge" ]] || fail "workspace/tools/firefly-bridge missing"
   [[ -f "${ROOT_DIR}/workspace/config/mappings.yml.example" ]] || fail "workspace/config/mappings.yml.example missing"
-  [[ -f "${ROOT_DIR}/workspace/config/policy.yml" ]] || fail "workspace/config/policy.yml missing"
+  [[ -f "${ROOT_DIR}/workspace/config/policy.yml.example" ]] || fail "workspace/config/policy.yml.example missing"
 
   "${PYTHON_BIN}" -m compileall "${ROOT_DIR}/src" "${ROOT_DIR}/scripts" >/dev/null
 fi

@@ -424,6 +424,73 @@ class TelegramSetupAndAutofillTest(unittest.TestCase):
         self.assertEqual(tx["description"], "Spesa")
         self.assertEqual(tx["date"], (bot.date.today() - bot.timedelta(days=1)).isoformat())
 
+    def test_direct_withdrawal_uses_expense_draft(self) -> None:
+        service = _DraftService()
+        state = {
+            "finance_profile": {
+                "setup_complete": True,
+                "expense_source_account": "Accounts",
+                "expense_destination_account": "Out",
+            }
+        }
+
+        response = bot.parse_direct_write_sentence(service, "withdraw €50 from ATM", state)
+
+        self.assertIsNotNone(response)
+        self.assertIsNotNone(service.last_payload)
+        tx = service.last_payload["transactions"][0]
+        self.assertEqual(tx["type"], "withdrawal")
+        self.assertEqual(tx["amount"], "50")
+        self.assertEqual(tx["source_name"], "Accounts")
+
+    def test_direct_income_accepts_salary_without_currency_symbol(self) -> None:
+        service = _DraftService()
+        state = {
+            "finance_profile": {
+                "setup_complete": True,
+                "income_source_account": "Employer",
+                "income_destination_account": "Main Checking",
+            }
+        }
+
+        response = bot.parse_direct_write_sentence(service, "received salary 1500 today", state)
+
+        self.assertIsNotNone(response)
+        self.assertIsNotNone(service.last_payload)
+        tx = service.last_payload["transactions"][0]
+        self.assertEqual(tx["type"], "deposit")
+        self.assertEqual(tx["amount"], "1500")
+        self.assertEqual(tx["description"], "Salary")
+
+    def test_transfer_without_accounts_prompts_with_asset_accounts(self) -> None:
+        service = _DraftService()
+        state: dict[str, Any] = {}
+
+        response = bot.process_message(service, "transfer €100", state)
+
+        self.assertIn("account to transfer from", response.text)
+        self.assertIn("Available accounts:", response.text)
+        self.assertIn("Main Checking", response.text)
+        self.assertIn("Cash", response.text)
+        pending = state.get("pending_transaction_resolution")
+        self.assertIsInstance(pending, dict)
+        assert isinstance(pending, dict)
+        self.assertEqual(pending.get("fields"), ["source", "destination"])
+
+    def test_transfer_with_destination_only_prompts_for_source(self) -> None:
+        service = _DraftService()
+        state: dict[str, Any] = {}
+
+        response = bot.process_message(service, "transfer €100 to Cash", state)
+
+        self.assertIn("account to transfer from", response.text)
+        pending = state.get("pending_transaction_resolution")
+        self.assertIsInstance(pending, dict)
+        assert isinstance(pending, dict)
+        self.assertEqual(pending.get("fields"), ["source"])
+        params = pending["payload"]["params"]
+        self.assertEqual(str(params.get("destination")).casefold(), "cash")
+
     def test_currency_spent_sentence_creates_draft_before_report_intent(self) -> None:
         service = _DraftService()
         state = {

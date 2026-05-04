@@ -35,7 +35,14 @@ from firefly_companion.client import FireflyAPIError, FireflyClient
 from firefly_companion.config import BridgeSettings, ConfigurationError
 from firefly_companion.conversation import build_clarification_prompt
 from firefly_companion.draft_manager import DraftManager, DraftPhase, load_draft_session, save_draft_session
-from firefly_companion.intent_parser import extract_payment_method, extract_recurrence, fuzzy_match_category, parse_deterministic_with_fallback
+from firefly_companion.intent_parser import (
+    extract_payment_method,
+    extract_recurrence,
+    fuzzy_match_category,
+    parse_amount_from_text as _parse_amount_from_text,
+    parse_deterministic_with_fallback,
+    parse_natural_intent_payload as _parse_natural_intent_payload,
+)
 from firefly_companion.logging_utils import configure_logging
 from firefly_companion.object_cache import FireflyObjectCache
 from firefly_companion.receipt_parser import count_visible_transactions
@@ -125,6 +132,7 @@ INTENT_VALUES = {
     "create_expense",
     "create_income",
     "create_transfer",
+    "search_transactions",
     "clarify",
 }
 
@@ -454,7 +462,7 @@ def detect_language(text: str | None) -> str:
     return conversation_module.detect_language(text)
 
 
-def localize(text_en: str, text_it: str, *, source_text: str | None = None) -> str:
+def localize(text_en: str, text_it: str | None = None, *, source_text: str | None = None) -> str:
     return conversation_module.localize(text_en, text_it, source_text=source_text)
 
 
@@ -3392,6 +3400,21 @@ def build_router_instructions(service: BridgeService) -> str:
         "\"yes_high_value\":false"
         "}"
         "}\n"
+        "Intent-specific required params:\n"
+        "- create_expense: amount (required), description (required), source (asset account), destination (expense account), category, budget, date, merchant\n"
+        "- create_income: amount (required), description (required), source (revenue account), destination (asset account), category, date\n"
+        "- create_transfer: amount (required), description (required), source (asset account, required), destination (asset account, required), date\n"
+        "- create_recurrence: cadence (monthly|weekly|yearly|daily, required), amount (required), title (required), description, source, destination, category, budget, first_date (YYYY-MM-DD)\n"
+        "- delete_recurrence: recurrence_id (required) or title (required, for name-based lookup)\n"
+        "- set_budget_limit: budget_name (required), amount (required), month (YYYY-MM, required)\n"
+        "- create_account: name (required), account_type (asset|cash|expense|revenue, required)\n"
+        "- create_category: name (required)\n"
+        "- create_budget: name (required), amount (optional)\n"
+        "- get_recent: days or start_date+end_date, query (optional keyword)\n"
+        "- top_spending_categories: month or start_date+end_date, with_graph (bool), all_categories (bool)\n"
+        "- compare_periods: left_period (object with month or start_date+end_date), right_period (same), metric (summary|income_vs_spending|spending_total|top_spending_categories)\n"
+        "ATM/cash withdrawal = create_expense (it is a Firefly withdrawal type, not a separate intent).\n"
+        "A transfer without explicit source account: use create_transfer but leave source empty; the bot will ask for it.\n"
         "Rules:\n"
         "- Use clarify if the user intent is ambiguous or a write request is missing key details.\n"
         "- reply should be in the same language as the user when intent=clarify.\n"
@@ -3456,12 +3479,13 @@ def reset_router_session(state: dict[str, Any]) -> None:
 
 def perform_router_request(service: BridgeService, text: str, state: dict[str, Any]) -> dict[str, Any]:
     instructions = build_router_instructions(service)
-    raw_text = call_ai_text(instructions, text, max_tokens=400)
+    raw_text = call_ai_text(instructions, text, max_tokens=600)
     payload = extract_json_object(raw_text)
     state["router_consecutive_failures"] = 0
     return payload
 
 
+# Note: this bot defines its own router loop around ai_router.call_ai_text.
 def run_picoclaw_router(service: BridgeService, text: str, state: dict[str, Any]) -> dict[str, Any] | None:
     for attempt in range(2):
         try:
@@ -4246,10 +4270,7 @@ def as_bool(value: str | None, *, default: bool = False) -> bool:
 
 
 def parse_amount_from_text(text: str) -> str | None:
-    match = re.search(r'(\d+(?:[.,]\d{1,2})?)\s*(?:€|eur|euro|usd|\$)?', text, re.IGNORECASE)
-    if not match:
-        return None
-    return match.group(1).replace(",", ".")
+    return _parse_amount_from_text(text)
 
 
 def format_money(value: Any, *, currency: str = "EUR ") -> str:
@@ -4525,193 +4546,10 @@ def parse_compare_period_params(text: str) -> tuple[dict[str, str], dict[str, st
 
 
 def parse_natural_intent_payload(text: str) -> dict[str, Any] | None:
-    lowered = normalize_natural_text(text)
-    if not lowered:
-        return None
-
-    graph_words = {"graph", "chart", "grafico", "grafica"}
-    category_words = {"category", "categories", "categoria", "categorie"}
-    top_words = {"top", "most", "used", "usate", "usati", "speso", "spent", "piu"}
-    balance_words = {"money i have", "balances", "balance", "saldo", "saldi", "net worth", "composition"}
-    spending_words = {"how much did i spend", "spent", "spending", "expenses", "expense", "quanto ho speso", "speso"}
-    income_words = {"earned", "income", "entrate", "entrata", "guadagnato", "guadagnati", "guadagno", "guadagnato?"}
-    cashflow_words = {"cashflow", "income vs", "incoming", "outgoing", "entrate", "uscite", "flusso di cassa"}
-    summary_words = {"summary", "riepilogo", "report", "resoconto"}
-    all_words = {"all", "tutte", "tutti"}
-    recent_words = {"recent", "recenti", "movimento", "movimenti", "transaction", "transactions", "transazione", "transazioni"}
-    receipt_words = {"receipt", "ricevuta", "scontrino", "bank screenshot", "screenshot banca", "foto ricevuta", "foto scontrino"}
-    send_words = {"send", "sending", "ti mando", "mando", "invio", "inoltro"}
-    budget_words = {"budget", "budget rimasto", "limite budget", "budget limit"}
-    recurrence_words = {"ricorrenza", "ricorrenze", "recurrence", "recurrences", "ricorrenti", "ricorrente", "recurring"}
-
-    params = parse_natural_period_values(lowered)
-    wants_all_categories = contains_any(lowered, all_words) and contains_any(lowered, category_words)
-
-    if contains_any(lowered, receipt_words) and contains_any(lowered, send_words):
-        return {"intent": "clarify", "confidence": 0.98, "reply": build_receipt_intro_reply(text), "source_text": text, "params": {}}
-
-    if contains_any(lowered, graph_words) and contains_any(lowered, budget_words):
-        return {"intent": "graph_budget", "confidence": 0.9, "reply": "", "source_text": text, "params": {**params}}
-
-    if contains_any(lowered, graph_words) and contains_any(lowered, recurrence_words):
-        return {"intent": "graph_recurrences", "confidence": 0.9, "reply": "", "source_text": text, "params": {}}
-
-    if contains_any(lowered, recurrence_words) and any(
-        w in lowered for w in {"mostra", "lista", "list", "show", "elenca", "vedi", "fammi vedere", "quali"}
-    ):
-        return {"intent": "list_recurrences", "confidence": 0.88, "reply": "", "source_text": text, "params": {}}
-
-    comparison_periods = parse_compare_period_params(text)
-    if comparison_periods is not None:
-        left_period, right_period = comparison_periods
-        metric = "summary"
-        if contains_any(lowered, category_words):
-            metric = "top_spending_categories"
-        elif contains_any(lowered, income_words) and any(word in lowered for word in {"spes", "spend", "uscite", "outgoing"}):
-            metric = "income_vs_spending"
-        elif contains_any(lowered, spending_words):
-            metric = "spending_total"
-        return {
-            "intent": "compare_periods",
-            "confidence": 0.88,
-            "reply": "",
-            "source_text": text,
-            "params": {
-                "metric": metric,
-                "left_period": left_period,
-                "right_period": right_period,
-            },
-        }
-
-    if contains_any(lowered, income_words) and any(word in lowered for word in {"spes", "spend", "uscite", "outgoing", "entrate", "income", "earned", "guadagn"}):
-        return {"intent": "get_income_vs_spending", "confidence": 0.95, "reply": "", "source_text": text, "params": {**params}}
-
-    if contains_any(lowered, category_words) and contains_any(lowered, top_words):
-        return {
-            "intent": "top_spending_categories",
-            "confidence": 0.95,
-            "reply": "",
-            "source_text": text,
-            "params": {**params, "with_graph": contains_any(lowered, graph_words), "all_categories": wants_all_categories},
-        }
-
-    if params and contains_any(lowered, category_words):
-        return {
-            "intent": "top_spending_categories",
-            "confidence": 0.88,
-            "reply": "",
-            "source_text": text,
-            "params": {**params, "with_graph": contains_any(lowered, graph_words), "all_categories": wants_all_categories},
-        }
-
-    if contains_any(lowered, graph_words) and contains_any(lowered, category_words):
-        return {
-            "intent": "top_spending_categories",
-            "confidence": 0.9,
-            "reply": "",
-            "source_text": text,
-            "params": {**params, "with_graph": True, "all_categories": wants_all_categories},
-        }
-
-    if contains_any(lowered, graph_words) and contains_any(lowered, balance_words):
-        return {"intent": "graph_balances", "confidence": 0.9, "reply": "", "source_text": text, "params": {**params}}
-
-    if contains_any(lowered, graph_words) and contains_any(lowered, cashflow_words):
-        return {"intent": "graph_cashflow", "confidence": 0.9, "reply": "", "source_text": text, "params": {**params}}
-
-    if contains_any(lowered, graph_words) and ("spes" in lowered or "spend" in lowered):
-        return {"intent": "graph_spending", "confidence": 0.9, "reply": "", "source_text": text, "params": {**params}}
-
-    if contains_any(lowered, spending_words) and not any(word in lowered for word in {"add expense", "expense ", "spesa ", "paid ", "pagato", "comprato", "bought"}):
-        return {"intent": "get_spending_total", "confidence": 0.9, "reply": "", "source_text": text, "params": {**params}}
-
-    if contains_any(lowered, summary_words):
-        return {"intent": "get_summary", "confidence": 0.8, "reply": "", "source_text": text, "params": {**params}}
-
-    if contains_any(lowered, recent_words):
-        query = extract_recent_query(text)
-        if query or params or "recent" in lowered or "recenti" in lowered:
-            payload_params = {**params}
-            if query:
-                payload_params["query"] = query
-            return {"intent": "get_recent", "confidence": 0.86, "reply": "", "source_text": text, "params": payload_params}
-
-    # --- List commands ---
-    list_trigger_words = {"lista", "list", "mostra", "elenca", "show", "fammi vedere", "quali sono", "dimmi", "i miei", "my"}
-    budget_list_words = {"budget", "budgets"}
-    account_list_words = {"conto", "conti", "account", "accounts"}
-
-    if contains_any(lowered, list_trigger_words) and contains_any(lowered, budget_list_words):
-        return {"intent": "list_budgets", "confidence": 0.88, "reply": "", "source_text": text, "params": {}}
-
-    if contains_any(lowered, list_trigger_words) and contains_any(lowered, account_list_words):
-        return {"intent": "list_accounts", "confidence": 0.88, "reply": "", "source_text": text, "params": {}}
-
-    if contains_any(lowered, list_trigger_words) and contains_any(lowered, category_words):
-        return {"intent": "list_categories", "confidence": 0.88, "reply": "", "source_text": text, "params": {}}
-
-    # --- Transfer detection ---
-    transfer_words = {"transfer", "trasferimento", "trasferisci", "trasferire", "move", "sposta", "gira", "manda"}
-    from_to_en = re.search(r'\bfrom\s+([a-zA-ZÀ-ÿ][a-zA-ZÀ-ÿ0-9 _-]{1,50}?)\s+to\s+([a-zA-ZÀ-ÿ][a-zA-ZÀ-ÿ0-9 _-]{1,50})(?:\s|$)', lowered)
-    from_to_it = re.search(r'\bda\s+([a-zA-ZÀ-ÿ][a-zA-ZÀ-ÿ0-9 _-]{1,50}?)\s+(?:a|al|alla|nel)\s+([a-zA-ZÀ-ÿ][a-zA-ZÀ-ÿ0-9 _-]{1,50})(?:\s|$)', lowered)
-    from_to = from_to_en or from_to_it
-    if contains_any(lowered, transfer_words) and from_to:
-        src = clean_free_text_slot(from_to.group(1)) or from_to.group(1).strip()
-        dst = clean_free_text_slot(from_to.group(2)) or from_to.group(2).strip()
-        return {
-            "intent": "create_transfer",
-            "confidence": 0.88,
-            "reply": "",
-            "source_text": text,
-            "params": {
-                "amount": parse_amount_from_text(lowered),
-                "source": src,
-                "destination": dst,
-                "description": f"{src} → {dst}",
-            },
-        }
-
-    # --- Budget set detection ---
-    budget_set_words = {"set", "imposta", "fissa", "aggiorna", "limit", "limite", "cap"}
-    if contains_any(lowered, budget_set_words) and "budget" in lowered:
-        amount = parse_amount_from_text(lowered)
-        budget_name_match = re.search(r'budget\s+["\']?([a-zA-ZÀ-ÿ][a-zA-ZÀ-ÿ0-9 _-]{1,40}?)["\']?\s+(?:a|to|at|=|\s)', lowered)
-        budget_name = clean_free_text_slot(budget_name_match.group(1)) if budget_name_match else None
-        if amount:
-            return {
-                "intent": "set_budget_limit",
-                "confidence": 0.82,
-                "reply": "",
-                "source_text": text,
-                "params": {**params, "budget_name": budget_name, "amount": amount},
-            }
-
-    # --- Budget report detection ---
-    budget_report_words = {"budgetreport", "reportbudget", "report budget", "budget report"}
-    if any(phrase in lowered for phrase in budget_report_words):
-        return {
-            "intent": "budget_report",
-            "confidence": 0.85,
-            "reply": "",
-            "source_text": text,
-            "params": {**params},
-        }
-
-    # --- Search / find transaction detection ---
-    find_words = {"trova", "cerca", "find", "look for"}
-    if any(word in lowered for word in find_words):
-        search_match = re.search(r'\b(?:trova|cerca|find|look\s+for)\s+(.+)', lowered)
-        query = clean_free_text_slot(search_match.group(1)) if search_match else None
-        if query:
-            return {
-                "intent": "search_transactions",
-                "confidence": 0.80,
-                "reply": "",
-                "source_text": text,
-                "params": {"query": query, **params},
-            }
-
-    return None
+    payload = _parse_natural_intent_payload(text)
+    if isinstance(payload, dict) and payload.get("intent") == "clarify" and not payload.get("reply"):
+        payload["reply"] = build_receipt_intro_reply(text)
+    return payload
 
 
 def interpret_natural_command(text: str) -> str | None:
@@ -5163,10 +5001,10 @@ def execute_intent(service: BridgeService, payload: dict[str, Any], state: dict[
                 ]))
             ]
         if not records:
-            return BotResponse(localize(f"No results for '{query}'.", f"Nessun risultato per '{query}'.", source_text=source_text))
+            return BotResponse(bot_text("search_no_results", source_text=source_text, query=query))
         return BotResponse(format_transactions(
             records[:20],
-            title=localize(f"Results for '{query}':", f"Risultati per '{query}':", source_text=source_text),
+            title=bot_text("search_results_title", source_text=source_text, query=query),
             source_text=source_text,
         ))
 
@@ -5767,6 +5605,9 @@ def parse_direct_write_sentence(service: BridgeService, text: str, state: dict[s
         r"\bpagato\b", r"\bcomprato\b", r"ho\s+speso\b", r"ho\s+pagato\b",
         r"\badd\s+(?:an?\s+)?expense\b", r"\baggiungi\s+(?:una?\s+)?spesa\b",
         r"\baggiungi\b(?=.*(?:€|eur(?:o)?))",
+        r"\bwithdraw\b", r"\bwithdrew\b", r"\bwithdrawal\b",
+        r"\bprelievo\b", r"\bprelevo\b", r"\bho\s+prelevato\b", r"\bprelevat\b",
+        r"\batm\b",
     ]
     income_patterns = [
         r"\bincome\b", r"\bsalary\b", r"\breceived\b", r"\bdeposit\b",
@@ -5794,7 +5635,16 @@ def parse_direct_write_sentence(service: BridgeService, text: str, state: dict[s
         re.IGNORECASE,
     )
     if not currency_amount_match:
-        return None
+        if transaction_kind == "deposit":
+            salary_signals = {"salary", "stipendio", "paycheck", "payslip", "busta paga", "wages"}
+            if any(signal in lowered for signal in salary_signals):
+                currency_amount_match = re.search(
+                    r'(\d+(?:[.,]\d{1,2})?)',
+                    text,
+                    re.IGNORECASE,
+                )
+        if not currency_amount_match:
+            return None
     raw_amount = (currency_amount_match.group(1) or currency_amount_match.group(2) or "").replace(",", ".")
     if not raw_amount:
         return None
@@ -5838,6 +5688,14 @@ def parse_direct_write_sentence(service: BridgeService, text: str, state: dict[s
         description_hint = f"{source} → {destination}"
 
     description = description_hint or merchant
+    if not description and transaction_kind == "deposit":
+        if any(signal in lowered for signal in {"salary", "paycheck", "payslip", "wages"}):
+            description = "Salary"
+        elif any(signal in lowered for signal in {"stipendio", "busta paga"}):
+            description = "Stipendio"
+    if not description and transaction_kind == "withdrawal":
+        if any(signal in lowered for signal in {"withdraw", "withdrew", "withdrawal", "atm", "prelievo", "prelevo", "prelevat", "bancomat"}):
+            description = "Prelievo ATM" if locale_language(text) == "it" else "ATM withdrawal"
     if not description:
         # No meaningful description extractable — bail out; caller will show help text.
         return None
@@ -6589,14 +6447,10 @@ def process_message(service: BridgeService, text: str, state: dict[str, Any]) ->
             ]))
         ]
         if not records:
-            return BotResponse(localize(
-                f"No transactions found matching '{query}'.",
-                f"Nessuna transazione trovata per '{query}'.",
-                source_text=text,
-            ))
+            return BotResponse(bot_text("search_no_results", source_text=text, query=query))
         return BotResponse(format_transactions(
             records[:20],
-            title=localize(f"Results for '{query}':", f"Risultati per '{query}':", source_text=text),
+            title=bot_text("search_results_title", source_text=text, query=query),
             source_text=text,
         ))
 
