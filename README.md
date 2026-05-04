@@ -485,51 +485,6 @@ The entrypoint rewrites the internal config files on every restart, so the new t
 
 ---
 
-## Running the companion next to a test Firefly instance
-
-If you want to run everything locally for testing and do not have a Firefly III instance yet:
-
-```bash
-docker compose -f docker-compose.yml -f docker-compose.example-firefly.yml --profile example-firefly up -d --build
-```
-
-This starts a local Firefly III at `http://127.0.0.1:8080`. Finish the Firefly setup in your browser, create a personal access token from the profile menu, save it to `secrets/firefly_access_token.txt`, then restart the companion:
-
-```bash
-docker compose restart companion
-```
-
----
-
-## CLI commands
-
-You can run any operation directly from the command line inside the container:
-
-```bash
-# Health check
-docker compose exec companion python3 -m firefly_companion.cli health
-
-# List accounts
-docker compose exec companion python3 -m firefly_companion.cli accounts list --type asset
-docker compose exec companion python3 -m firefly_companion.cli accounts balances
-
-# Categories and budgets
-docker compose exec companion python3 -m firefly_companion.cli categories list
-docker compose exec companion python3 -m firefly_companion.cli budgets list
-
-# Summaries and transactions
-docker compose exec companion python3 -m firefly_companion.cli summary month --month 2026-04
-docker compose exec companion python3 -m firefly_companion.cli transactions search --days 7 --query groceries
-
-# Dry-run expense
-docker compose exec companion python3 -m firefly_companion.cli expense dry-run \
-  --amount 42.50 \
-  --description "Groceries" \
-  --merchant coop
-```
-
----
-
 ## Troubleshooting
 
 **The bot does not respond on Telegram.**
