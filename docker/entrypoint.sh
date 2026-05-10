@@ -203,6 +203,16 @@ for path in paths:
 PY
 }
 
+unset_picoclaw_flat_secret_env() {
+  unset TELEGRAM_BOT_TOKEN TELEGRAM_BOT_TOKEN_FILE
+  unset OPENAI_API_KEY OPENAI_API_KEY_FILE
+  unset ANTHROPIC_API_KEY ANTHROPIC_API_KEY_FILE
+  unset OPENROUTER_API_KEY OPENROUTER_API_KEY_FILE
+  unset GROQ_API_KEY GROQ_API_KEY_FILE
+  unset GOOGLE_API_KEY GOOGLE_API_KEY_FILE
+  unset PDFAPIHUB_API_KEY PDFAPIHUB_API_KEY_FILE
+}
+
 ensure_dir "${PICOCLAW_HOME}" 700
 ensure_dir "${PICOCLAW_CONFIG_DIR}" 700
 ensure_dir "${PICOCLAW_WORKSPACE}" 700
@@ -673,5 +683,11 @@ for path in paths:
 PY
 
 scrub_picoclaw_security_yml "before-exec"
+
+if [[ "$1" == "picoclaw" ]]; then
+  # Newer PicoClaw maps exported FOO_BAR secrets back into flat config fields
+  # before strict decoding. Secrets are already in .security.yml at this point.
+  unset_picoclaw_flat_secret_env
+fi
 
 exec "$@"

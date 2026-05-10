@@ -15,6 +15,21 @@ class ComposeEnvTest(unittest.TestCase):
         self.assertNotIn("PICOCLAW_" + "GATEWAY_TOKEN", compose)
         self.assertNotIn("PICOCLAW_" + "BIND", compose)
 
+    def test_entrypoint_unsets_flat_secret_env_before_picoclaw_exec(self) -> None:
+        entrypoint = Path("docker/entrypoint.sh").read_text(encoding="utf-8")
+        self.assertIn("unset_picoclaw_flat_secret_env", entrypoint)
+        self.assertIn('if [[ "$1" == "picoclaw" ]]; then', entrypoint)
+        for name in [
+            "TELEGRAM_BOT_TOKEN",
+            "OPENAI_API_KEY",
+            "ANTHROPIC_API_KEY",
+            "OPENROUTER_API_KEY",
+            "GROQ_API_KEY",
+            "GOOGLE_API_KEY",
+            "PDFAPIHUB_API_KEY",
+        ]:
+            self.assertIn(f"unset {name}", entrypoint)
+
 
 if __name__ == "__main__":
     unittest.main()
