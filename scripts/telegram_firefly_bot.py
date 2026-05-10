@@ -2336,7 +2336,36 @@ def commit_pending_transaction(service: BridgeService, state: dict[str, Any], te
 
         save_draft_session(state, None)
         created = result.get("result", {})
+        # Remember the journal ID so the user can say "dividi per N" right after.
+        tx_data = _merged_created_transaction(created, payload)
+        _txn_id = tx_data.get("transaction_journal_id") or tx_data.get("transaction_id")
+        if _txn_id:
+            state["last_committed_txn"] = {
+                "id": str(_txn_id),
+                "description": str(tx_data.get("description") or ""),
+                "amount": str(tx_data.get("amount") or ""),
+            }
         return BotResponse(format_created_transaction_result(created, fallback_payload=payload, source_text=text))
+
+    if kind == "transaction_amount_split":
+        txn_id = str((payload or {}).get("txn_id") or "").strip()
+        new_amount = str((payload or {}).get("new_amount") or "").strip()
+        description = str((payload or {}).get("description") or "").strip()
+        if not txn_id or not new_amount:
+            clear_pending_action(state)
+            return BotResponse(localize("Split action incomplete.", "Azione di divisione incompleta.", source_text=text))
+        if service.client.update_transaction(int(txn_id), {"amount": new_amount}):
+            clear_pending_action(state)
+            state["last_committed_txn"] = {"id": txn_id, "description": description, "amount": new_amount}
+            return BotResponse(
+                localize(
+                    f"✅ Transaction updated.\n{description}: {new_amount} EUR",
+                    f"✅ Transazione aggiornata.\n{description}: {new_amount} EUR",
+                    source_text=text,
+                )
+            )
+        clear_pending_action(state)
+        return BotResponse(localize("❌ Could not update the transaction.", "❌ Impossibile aggiornare la transazione.", source_text=text))
 
     if kind == "transaction_batch_create":
         payloads = list((payload or {}).get("transactions") or []) if isinstance(payload, dict) else []
@@ -5622,6 +5651,123 @@ def execute_intent(service: BridgeService, payload: dict[str, Any], state: dict[
     return BotResponse("I could not map that request to a supported Firefly action yet.")
 
 
+# ---------------------------------------------------------------------------
+# Split transaction intent
+# ---------------------------------------------------------------------------
+
+_SPLIT_PATTERN = re.compile(
+    r"""
+    (?:
+        divid[ia](?:la|lo|le)?   # dividi / dividila / dividilo
+        | split(?:\s+it)?
+        | divide(?:\s+it)?
+    )
+    (?:\s+(?:quella\s+di\s+\S+\s+(?:al?\s+)?\S+\s+)?(?:l['']ultima\s+)?)?
+    \s+
+    (?:per|by|in)
+    \s+
+    (\d+(?:[.,]\d+)?)            # group 1: divisor
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
+
+def handle_split_transaction_intent(
+    service: BridgeService,
+    text: str,
+    state: dict[str, Any],
+) -> BotResponse | None:
+    """Detect 'dividi per N' / 'split by N' and queue a pending_action to halve the amount."""
+    m = _SPLIT_PATTERN.search(text.casefold())
+    if not m:
+        return None
+
+    try:
+        divisor = Decimal(m.group(1).replace(",", "."))
+        if divisor <= 0:
+            return None
+    except Exception:
+        return None
+
+    last = state.get("last_committed_txn")
+    if isinstance(last, dict) and last.get("id") and last.get("amount"):
+        txn_id = str(last["id"])
+        description = str(last.get("description") or "—")
+        try:
+            old_amount = Decimal(str(last["amount"]))
+        except Exception:
+            old_amount = None
+    else:
+        # Fetch latest transaction from Firefly.
+        try:
+            records = flatten_transactions(
+                service.client.list_transactions(
+                    start=date.today() - timedelta(days=30),
+                    end=date.today(),
+                    limit=1,
+                )
+            )
+        except Exception:
+            records = []
+        if not records:
+            return BotResponse(
+                localize(
+                    "I couldn't find a recent transaction to split.",
+                    "Non ho trovato transazioni recenti da dividere.",
+                    source_text=text,
+                )
+            )
+        rec = records[0]
+        txn_id = str(rec.get("transaction_id") or rec.get("journal_id") or "")
+        if not txn_id:
+            return BotResponse(
+                localize(
+                    "I couldn't retrieve the transaction ID.",
+                    "Non sono riuscito a ottenere l'ID della transazione.",
+                    source_text=text,
+                )
+            )
+        description = str(rec.get("description") or "—")
+        try:
+            old_amount = Decimal(str(rec["amount"]))
+        except Exception:
+            old_amount = None
+
+    if old_amount is None or old_amount <= 0:
+        return BotResponse(
+            localize(
+                "I couldn't read the transaction amount.",
+                "Non sono riuscito a leggere l'importo della transazione.",
+                source_text=text,
+            )
+        )
+
+    new_amount = (old_amount / divisor).quantize(Decimal("0.01"))
+
+    preview = format_pending_action_preview(
+        localize(
+            f"Last transaction: {description}",
+            f"Ultima transazione: {description}",
+            source_text=text,
+        ),
+        [
+            localize(
+                f"Current amount: {old_amount:.2f}€ → new amount: {new_amount:.2f}€",
+                f"Importo attuale: {old_amount:.2f}€ → nuovo importo: {new_amount:.2f}€",
+                source_text=text,
+            )
+        ],
+        localize("Confirm? (yes / no)", "Confermo? (si / no)", source_text=text),
+    )
+    remember_pending_action(
+        state,
+        kind="transaction_amount_split",
+        payload={"txn_id": txn_id, "description": description, "old_amount": str(old_amount), "new_amount": str(new_amount)},
+        preview=preview,
+    )
+    return BotResponse(preview)
+
+
 def parse_direct_write_sentence(service: BridgeService, text: str, state: dict[str, Any]) -> BotResponse | None:
     """Regex-based fallback for explicit transaction sentences when the AI router is unavailable.
 
@@ -6199,6 +6345,10 @@ def process_message(service: BridgeService, text: str, state: dict[str, Any]) ->
             save_draft_session(state, draft_session)
             return BotResponse(advanced or manager.build_review_message(draft_session))
 
+        split_response = handle_split_transaction_intent(service, text, state)
+        if split_response is not None:
+            return split_response
+
         direct_write = parse_direct_write_sentence(service, text, state)
         if direct_write is not None:
             return direct_write
@@ -6722,6 +6872,10 @@ def process_message(service: BridgeService, text: str, state: dict[str, Any]) ->
             return BotResponse(format_duplicate_blocked(result["duplicate"], source_text=text))
         created = result.get("result", {})
         clear_pending_transaction(state)
+        _tx_data = _merged_created_transaction(created, payload)
+        _tid = _tx_data.get("transaction_journal_id") or _tx_data.get("transaction_id")
+        if _tid:
+            state["last_committed_txn"] = {"id": str(_tid), "description": str(_tx_data.get("description") or ""), "amount": str(_tx_data.get("amount") or "")}
         return BotResponse(format_created_transaction_result(created, fallback_payload=payload, source_text=text))
 
     if command == "/newcategory":
