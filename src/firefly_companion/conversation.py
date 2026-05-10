@@ -113,12 +113,12 @@ def configured_chat_language() -> str:
 
 def detect_language(text: str | None) -> str:
     """Detect language from text content. Returns 'it' or 'en'."""
-    configured = configured_chat_language()
-    if configured in {"en", "it"}:
-        return configured
     hinted = explicit_language_hint(text)
     if hinted:
         return hinted
+    configured = configured_chat_language()
+    if configured in {"en", "it"}:
+        return configured
     lowered = (text or "").casefold()
     for language, markers in _LANGUAGE_MARKERS.items():
         if any(marker in lowered for marker in markers):
@@ -128,12 +128,12 @@ def detect_language(text: str | None) -> str:
 
 def locale_language(source_text: str | None = None) -> str:
     """Determine the locale language for response generation."""
-    configured = configured_chat_language()
-    if configured in {"en", "it"}:
-        return configured
     hinted = explicit_language_hint(source_text)
     if hinted:
         return hinted
+    configured = configured_chat_language()
+    if configured in {"en", "it"}:
+        return configured
     return detect_language(source_text)
 
 

@@ -2336,7 +2336,36 @@ def commit_pending_transaction(service: BridgeService, state: dict[str, Any], te
 
         save_draft_session(state, None)
         created = result.get("result", {})
+        # Remember the journal ID so the user can say "dividi per N" right after.
+        tx_data = _merged_created_transaction(created, payload)
+        _txn_id = tx_data.get("transaction_journal_id") or tx_data.get("transaction_id")
+        if _txn_id:
+            state["last_committed_txn"] = {
+                "id": str(_txn_id),
+                "description": str(tx_data.get("description") or ""),
+                "amount": str(tx_data.get("amount") or ""),
+            }
         return BotResponse(format_created_transaction_result(created, fallback_payload=payload, source_text=text))
+
+    if kind == "transaction_amount_split":
+        txn_id = str((payload or {}).get("txn_id") or "").strip()
+        new_amount = str((payload or {}).get("new_amount") or "").strip()
+        description = str((payload or {}).get("description") or "").strip()
+        if not txn_id or not new_amount:
+            clear_pending_action(state)
+            return BotResponse(localize("Split action incomplete.", "Azione di divisione incompleta.", source_text=text))
+        if service.client.update_transaction(int(txn_id), {"amount": new_amount}):
+            clear_pending_action(state)
+            state["last_committed_txn"] = {"id": txn_id, "description": description, "amount": new_amount}
+            return BotResponse(
+                localize(
+                    f"✅ Transaction updated.\n{description}: {new_amount} EUR",
+                    f"✅ Transazione aggiornata.\n{description}: {new_amount} EUR",
+                    source_text=text,
+                )
+            )
+        clear_pending_action(state)
+        return BotResponse(localize("❌ Could not update the transaction.", "❌ Impossibile aggiornare la transazione.", source_text=text))
 
     if kind == "transaction_batch_create":
         payloads = list((payload or {}).get("transactions") or []) if isinstance(payload, dict) else []
@@ -3903,10 +3932,20 @@ def _extract_single_receipt_candidate(text: str | None, *, caption: str | None =
     )
 
 
+_RECEIPT_INCOME_KEYWORDS = frozenset({
+    "accredito", "bonifico ricevuto", "salary", "stipendio", "received payment",
+    "entrata", "ricevuto", "pagamento ricevuto", "hai ricevuto", "ricevuta",
+    "bonifico in entrata", "accredito bonifico", "credited",
+})
+
+
 def extract_receipt_candidates(text: str | None, *, caption: str | None = None) -> list[dict[str, Any]]:
     source = "\n".join(part for part in [caption, text] if part).strip()
     if not source:
         return []
+
+    normalized_source = normalize_natural_text(source)
+    default_kind = "create_income" if any(kw in normalized_source for kw in _RECEIPT_INCOME_KEYWORDS) else "create_expense"
 
     transaction_date = None
     date_match = re.search(r"\b(\d{2}[./]\d{2}[./]\d{2,4})\b", source)
@@ -3916,7 +3955,7 @@ def extract_receipt_candidates(text: str | None, *, caption: str | None = None) 
     candidates: list[dict[str, Any]] = []
     seen: set[tuple[str, str, str]] = set()
 
-    def append_candidate(*, amount: str, merchant: str | None, source_hint: str | None, snippet: str, transaction_kind: str = "create_expense") -> None:
+    def append_candidate(*, amount: str, merchant: str | None, source_hint: str | None, snippet: str, transaction_kind: str | None = None) -> None:
         clean_amount = amount.replace(",", ".")
         clean_merchant = titlecase_merchant(merchant) if merchant else None
         key = (
@@ -3927,18 +3966,20 @@ def extract_receipt_candidates(text: str | None, *, caption: str | None = None) 
         if key in seen:
             return
         seen.add(key)
+        kind = transaction_kind if transaction_kind is not None else default_kind
         candidates.append(
             _build_receipt_candidate(
                 source=source,
                 amount=clean_amount,
                 merchant=clean_merchant,
-                transaction_kind=transaction_kind,
+                transaction_kind=kind,
                 transaction_date=transaction_date,
                 source_hint=source_hint,
                 note_snippet=snippet,
             )
         )
 
+    # 1. POS payment blocks (BPER / standard Italian bank notifications)
     for match in re.finditer(
         r"pagamento\s+pos(?:\s+di)?\s+(\d+(?:[.,]\d{1,2})?)\s*(?:eur|euro|€)?\s+(?:presso|at)\s+([^\n]+)",
         source,
@@ -3950,8 +3991,24 @@ def extract_receipt_candidates(text: str | None, *, caption: str | None = None) 
             merchant=match.group(2).strip(" ."),
             source_hint=detect_receipt_source_hint(snippet) or detect_receipt_source_hint(source),
             snippet=snippet,
+            transaction_kind="create_expense",
         )
 
+    # 2. Generic bank notification: "€X,XX [presso|at|-] Merchant" or "Merchant €X,XX"
+    for match in re.finditer(
+        r"(?:€|EUR)\s*(\d+(?:[.,]\d{1,2})?)(?:\s*[-–]\s*|\s+(?:presso|at)\s+)([A-Za-zÀ-ÿ][^\n]{2,60})",
+        source,
+        re.IGNORECASE,
+    ):
+        snippet = match.group(0)
+        append_candidate(
+            amount=match.group(1),
+            merchant=match.group(2).strip(" .-"),
+            source_hint=detect_receipt_source_hint(source),
+            snippet=snippet,
+        )
+
+    # 3. Revolut blocks
     revolut_blocks = re.finditer(
         r"revolut[\s:,-]*([^\n€]{2,80}?)\s+(\d+(?:[.,]\d{1,2})?)\s*(?:eur|euro|€)",
         source,
@@ -3966,11 +4023,19 @@ def extract_receipt_candidates(text: str | None, *, caption: str | None = None) 
             snippet=snippet,
         )
 
+    # 4. Generic EUR amount lines (amount followed by EUR/€, OR € followed by amount)
     if not candidates:
         lines = [line.strip() for line in source.splitlines() if line.strip()]
         for index, line in enumerate(lines):
-            amount_match = re.search(r"(\d+(?:[.,]\d{1,2})?)\s*(?:eur|euro|€)\b", line, re.IGNORECASE)
+            amount_match = re.search(
+                r"(\d+(?:[.,]\d{1,2})?)\s*(?:eur|euro|€)\b|(?:€|eur(?:o)?)\s*(\d+(?:[.,]\d{1,2})?)",
+                line,
+                re.IGNORECASE,
+            )
             if not amount_match:
+                continue
+            raw_amount = amount_match.group(1) or amount_match.group(2)
+            if not raw_amount:
                 continue
             nearby = "\n".join(lines[max(index - 2, 0) : min(index + 2, len(lines))])
             source_hint = detect_receipt_source_hint(nearby) or detect_receipt_source_hint(source)
@@ -3985,7 +4050,7 @@ def extract_receipt_candidates(text: str | None, *, caption: str | None = None) 
             if merchant and source_hint and normalize_natural_text(merchant) == normalize_natural_text(source_hint):
                 merchant = lines[index - 1] if index > 0 else merchant
             if merchant:
-                append_candidate(amount=amount_match.group(1), merchant=merchant, source_hint=source_hint, snippet=nearby)
+                append_candidate(amount=raw_amount, merchant=merchant, source_hint=source_hint, snippet=nearby)
 
     if candidates:
         return candidates
@@ -5586,6 +5651,123 @@ def execute_intent(service: BridgeService, payload: dict[str, Any], state: dict[
     return BotResponse("I could not map that request to a supported Firefly action yet.")
 
 
+# ---------------------------------------------------------------------------
+# Split transaction intent
+# ---------------------------------------------------------------------------
+
+_SPLIT_PATTERN = re.compile(
+    r"""
+    (?:
+        divid[ia](?:la|lo|le)?   # dividi / dividila / dividilo
+        | split(?:\s+it)?
+        | divide(?:\s+it)?
+    )
+    (?:\s+(?:quella\s+di\s+\S+\s+(?:al?\s+)?\S+\s+)?(?:l['']ultima\s+)?)?
+    \s+
+    (?:per|by|in)
+    \s+
+    (\d+(?:[.,]\d+)?)            # group 1: divisor
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
+
+def handle_split_transaction_intent(
+    service: BridgeService,
+    text: str,
+    state: dict[str, Any],
+) -> BotResponse | None:
+    """Detect 'dividi per N' / 'split by N' and queue a pending_action to halve the amount."""
+    m = _SPLIT_PATTERN.search(text.casefold())
+    if not m:
+        return None
+
+    try:
+        divisor = Decimal(m.group(1).replace(",", "."))
+        if divisor <= 0:
+            return None
+    except Exception:
+        return None
+
+    last = state.get("last_committed_txn")
+    if isinstance(last, dict) and last.get("id") and last.get("amount"):
+        txn_id = str(last["id"])
+        description = str(last.get("description") or "—")
+        try:
+            old_amount = Decimal(str(last["amount"]))
+        except Exception:
+            old_amount = None
+    else:
+        # Fetch latest transaction from Firefly.
+        try:
+            records = flatten_transactions(
+                service.client.list_transactions(
+                    start=date.today() - timedelta(days=30),
+                    end=date.today(),
+                    limit=1,
+                )
+            )
+        except Exception:
+            records = []
+        if not records:
+            return BotResponse(
+                localize(
+                    "I couldn't find a recent transaction to split.",
+                    "Non ho trovato transazioni recenti da dividere.",
+                    source_text=text,
+                )
+            )
+        rec = records[0]
+        txn_id = str(rec.get("transaction_id") or rec.get("journal_id") or "")
+        if not txn_id:
+            return BotResponse(
+                localize(
+                    "I couldn't retrieve the transaction ID.",
+                    "Non sono riuscito a ottenere l'ID della transazione.",
+                    source_text=text,
+                )
+            )
+        description = str(rec.get("description") or "—")
+        try:
+            old_amount = Decimal(str(rec["amount"]))
+        except Exception:
+            old_amount = None
+
+    if old_amount is None or old_amount <= 0:
+        return BotResponse(
+            localize(
+                "I couldn't read the transaction amount.",
+                "Non sono riuscito a leggere l'importo della transazione.",
+                source_text=text,
+            )
+        )
+
+    new_amount = (old_amount / divisor).quantize(Decimal("0.01"))
+
+    preview = format_pending_action_preview(
+        localize(
+            f"Last transaction: {description}",
+            f"Ultima transazione: {description}",
+            source_text=text,
+        ),
+        [
+            localize(
+                f"Current amount: {old_amount:.2f}€ → new amount: {new_amount:.2f}€",
+                f"Importo attuale: {old_amount:.2f}€ → nuovo importo: {new_amount:.2f}€",
+                source_text=text,
+            )
+        ],
+        localize("Confirm? (yes / no)", "Confermo? (si / no)", source_text=text),
+    )
+    remember_pending_action(
+        state,
+        kind="transaction_amount_split",
+        payload={"txn_id": txn_id, "description": description, "old_amount": str(old_amount), "new_amount": str(new_amount)},
+        preview=preview,
+    )
+    return BotResponse(preview)
+
+
 def parse_direct_write_sentence(service: BridgeService, text: str, state: dict[str, Any]) -> BotResponse | None:
     """Regex-based fallback for explicit transaction sentences when the AI router is unavailable.
 
@@ -5786,7 +5968,46 @@ def process_receipt_message(service: BridgeService, bot_token: str, message: dic
         elif payload is None and fallback_payload is not None:
             payload = fallback_payload
     if payload is None:
-        return BotResponse(bot_text("receipt_unreadable", source_text=caption or extracted_text))
+        locale_src = caption or (extracted_text[:200] if extracted_text else None)
+        # Best-effort: try to extract at least an amount and create a partial draft
+        if extracted_text or caption:
+            raw_text = extracted_text or caption or ""
+            amt_match = re.search(
+                r"(?:€|eur(?:o)?)\s*(\d+(?:[.,]\d{1,2})?)|(\d+(?:[.,]\d{1,2})?)\s*(?:€|eur(?:o)?)",
+                raw_text,
+                re.IGNORECASE,
+            )
+            if amt_match:
+                raw_amount = (amt_match.group(1) or amt_match.group(2) or "").replace(",", ".")
+                if raw_amount:
+                    partial_payload = {
+                        "intent": "create_expense",
+                        "confidence": 0.3,
+                        "source_text": locale_src,
+                        "params": {
+                            "amount": raw_amount,
+                            "description": localize("Payment", "Pagamento", source_text=locale_src),
+                            "date": None,
+                            "live": False,
+                        },
+                    }
+                    try:
+                        resp = execute_intent(service, partial_payload, state)
+                        prefix = localize(
+                            "⚠️ I could read the amount but not all details — please check and correct this draft:",
+                            "⚠️ Ho letto l'importo ma non tutti i dettagli — controlla e correggi questa bozza:",
+                            source_text=locale_src,
+                        )
+                        return BotResponse(f"{prefix}\n\n{resp.text}")
+                    except Exception:
+                        pass
+            # No amount either — ask specifically
+            return BotResponse(localize(
+                "I could see text but couldn't find an amount. What was the total?",
+                "Ho visto del testo ma non sono riuscito a leggere l'importo. Qual era il totale?",
+                source_text=locale_src,
+            ))
+        return BotResponse(bot_text("receipt_unreadable", source_text=locale_src))
     response = execute_intent(service, payload, state)
     if visible_count > 1:
         counting_line = bot_text("receipt_counting", source_text=caption or extracted_text, count=visible_count)
@@ -6123,6 +6344,10 @@ def process_message(service: BridgeService, text: str, state: dict[str, Any]) ->
             advanced = manager.advance(draft_session, text)
             save_draft_session(state, draft_session)
             return BotResponse(advanced or manager.build_review_message(draft_session))
+
+        split_response = handle_split_transaction_intent(service, text, state)
+        if split_response is not None:
+            return split_response
 
         direct_write = parse_direct_write_sentence(service, text, state)
         if direct_write is not None:
@@ -6647,6 +6872,10 @@ def process_message(service: BridgeService, text: str, state: dict[str, Any]) ->
             return BotResponse(format_duplicate_blocked(result["duplicate"], source_text=text))
         created = result.get("result", {})
         clear_pending_transaction(state)
+        _tx_data = _merged_created_transaction(created, payload)
+        _tid = _tx_data.get("transaction_journal_id") or _tx_data.get("transaction_id")
+        if _tid:
+            state["last_committed_txn"] = {"id": str(_tid), "description": str(_tx_data.get("description") or ""), "amount": str(_tx_data.get("amount") or "")}
         return BotResponse(format_created_transaction_result(created, fallback_payload=payload, source_text=text))
 
     if command == "/newcategory":
@@ -6839,6 +7068,7 @@ def main() -> int:
                 },
             )
             if not initialized:
+                # On the very first run, we flush pending messages.
                 results = payload.get("result", [])
                 if results:
                     offset = max(int(update.get("update_id", 0)) + 1 for update in results)

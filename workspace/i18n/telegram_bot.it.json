@@ -31,7 +31,7 @@
     "draft_review_single": "Bozza preparata:",
     "draft_review_batch": "{count} transazioni preparate:",
     "draft_review_confirm_hint": "Scrivi 'ok' per salvare, o 'annulla' per scartare.",
-    "draft_correction_hint": "Puoi anche dire: 'cambia importo a X', 'cambia categoria', 'rileggi'.",
+    "draft_correction_hint": "Puoi anche dire: 'cambia importo a X', 'cambia categoria', 'cambia tipo a entrata/spesa', 'cambia budget a X', 'rileggi'.",
     "draft_no_category": "Non ho determinato una categoria. Quale uso? (scrivi un nome, o 'salta')",
     "receipt_counting": "Ho trovato {count} transazioni nell'immagine.",
     "receipt_amount_unreadable": "Non riesco a leggere l'importo. Puoi dirmelo?",

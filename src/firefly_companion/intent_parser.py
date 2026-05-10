@@ -19,10 +19,11 @@ def contains_any(text: str, words: set[str] | tuple[str, ...]) -> bool:
 
 
 def parse_amount_from_text(text: str) -> str | None:
-    match = re.search(r'(\d+(?:[.,]\d{1,2})?)\s*(?:â‚¬|eur|euro|usd|\$)?', text, re.IGNORECASE)
+    match = re.search(r'(?:€|eur(?:o)?|usd|\$)\s*(\d+(?:[.,]\d{1,2})?)|(\d+(?:[.,]\d{1,2})?)\s*(?:€|eur(?:o)?|usd|\$)?', text, re.IGNORECASE)
     if not match:
         return None
-    return match.group(1).replace(",", ".")
+    raw = (match.group(1) or match.group(2) or "").replace(",", ".")
+    return raw or None
 
 
 def extract_recent_query(text: str) -> str | None:

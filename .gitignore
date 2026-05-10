@@ -54,3 +54,4 @@ htmlcov/
 coverage.xml
 docker-data/
 data/
+.codex/config.toml
