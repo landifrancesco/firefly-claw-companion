@@ -11,7 +11,7 @@ BIN_ROOT="${BIN_ROOT:-/opt/firefly-picoclaw/bin}"
 RUNTIME_PORT="${PICOCLAW_PORT:-18790}"
 RUNTIME_HOST="${PICOCLAW_GATEWAY_HOST:-127.0.0.1}"
 VERIFY_ON_BOOT="${FIREFLY_RUNTIME_VERIFY_ON_BOOT:-true}"
-ENTRYPOINT_BUILD_MARKER="config-scrub-v3"
+ENTRYPOINT_BUILD_MARKER="config-scrub-v4"
 
 echo "firefly-picoclaw entrypoint ${ENTRYPOINT_BUILD_MARKER}" >&2
 
@@ -213,6 +213,16 @@ unset_picoclaw_flat_secret_env() {
   unset PDFAPIHUB_API_KEY PDFAPIHUB_API_KEY_FILE
 }
 
+unset_picoclaw_render_secret_env() {
+  unset PICOCLAW_RENDER_TELEGRAM_BOT_TOKEN
+  unset PICOCLAW_RENDER_OPENAI_API_KEY
+  unset PICOCLAW_RENDER_ANTHROPIC_API_KEY
+  unset PICOCLAW_RENDER_OPENROUTER_API_KEY
+  unset PICOCLAW_RENDER_GROQ_API_KEY
+  unset PICOCLAW_RENDER_GOOGLE_API_KEY
+  unset PICOCLAW_RENDER_PDFAPIHUB_API_KEY
+}
+
 ensure_dir "${PICOCLAW_HOME}" 700
 ensure_dir "${PICOCLAW_CONFIG_DIR}" 700
 ensure_dir "${PICOCLAW_WORKSPACE}" 700
@@ -231,6 +241,8 @@ GOOGLE_TOKEN="$(secret_from_standard_locations GOOGLE_API_KEY google_api_key)"
 TELEGRAM_TOKEN="$(secret_from_standard_locations TELEGRAM_BOT_TOKEN telegram_bot_token)"
 FIREFLY_TOKEN="$(secret_from_standard_locations FIREFLY_ACCESS_TOKEN firefly_access_token)"
 PDFAPIHUB_TOKEN="$(secret_from_standard_locations PDFAPIHUB_API_KEY pdfapihub_api_key)"
+
+unset_picoclaw_flat_secret_env
 
 if [[ -z "${FIREFLY_TOKEN}" ]]; then
   echo "Error: FIREFLY_ACCESS_TOKEN is required via env, *_FILE, Docker secret, or /run/host-secrets/firefly_access_token.txt." >&2
@@ -264,13 +276,13 @@ export TELEGRAM_TARGET_ID="${TELEGRAM_TARGET_ID:-${TELEGRAM_OWNER_ID:-}}"
 export FIREFLY_CHAT_LANGUAGE="${FIREFLY_CHAT_LANGUAGE:-auto}"
 export FIREFLY_ACCESS_TOKEN="${FIREFLY_TOKEN}"
 export FIREFLY_ACCESS_TOKEN_FILE="${PICOCLAW_CONFIG_DIR}/.security/firefly_access_token"
-export TELEGRAM_BOT_TOKEN="${TELEGRAM_TOKEN}"
-export OPENAI_API_KEY="${OPENAI_TOKEN}"
-export ANTHROPIC_API_KEY="${ANTHROPIC_TOKEN}"
-export OPENROUTER_API_KEY="${OPENROUTER_TOKEN}"
-export GROQ_API_KEY="${GROQ_TOKEN}"
-export GOOGLE_API_KEY="${GOOGLE_TOKEN}"
-export PDFAPIHUB_API_KEY="${PDFAPIHUB_TOKEN}"
+export PICOCLAW_RENDER_TELEGRAM_BOT_TOKEN="${TELEGRAM_TOKEN}"
+export PICOCLAW_RENDER_OPENAI_API_KEY="${OPENAI_TOKEN}"
+export PICOCLAW_RENDER_ANTHROPIC_API_KEY="${ANTHROPIC_TOKEN}"
+export PICOCLAW_RENDER_OPENROUTER_API_KEY="${OPENROUTER_TOKEN}"
+export PICOCLAW_RENDER_GROQ_API_KEY="${GROQ_TOKEN}"
+export PICOCLAW_RENDER_GOOGLE_API_KEY="${GOOGLE_TOKEN}"
+export PICOCLAW_RENDER_PDFAPIHUB_API_KEY="${PDFAPIHUB_TOKEN}"
 
 required_model_secret=""
 required_model_secret_name=""
@@ -320,10 +332,6 @@ fi
 if [[ "${TELEGRAM_ENABLED}" == "true" && -z "${TELEGRAM_OWNER_ID}" ]]; then
   echo "Error: TELEGRAM_OWNER_ID is required when Telegram is enabled." >&2
   exit 15
-fi
-
-if [[ ! -f "${PICOCLAW_CONFIG_DIR}/config.json" ]]; then
-  picoclaw onboard >/dev/null 2>&1 || true
 fi
 
 python3 <<'PY'
@@ -436,21 +444,21 @@ config_path.chmod(0o600)
 
 model_key = ""
 if model_name == "groq":
-    model_key = os.getenv("GROQ_API_KEY", "")
+    model_key = os.getenv("PICOCLAW_RENDER_GROQ_API_KEY", "")
 elif model_name == "openai":
-    model_key = os.getenv("OPENAI_API_KEY", "")
+    model_key = os.getenv("PICOCLAW_RENDER_OPENAI_API_KEY", "")
 elif model_name == "anthropic":
-    model_key = os.getenv("ANTHROPIC_API_KEY", "")
+    model_key = os.getenv("PICOCLAW_RENDER_ANTHROPIC_API_KEY", "")
 elif model_name == "openrouter":
-    model_key = os.getenv("OPENROUTER_API_KEY", "")
+    model_key = os.getenv("PICOCLAW_RENDER_OPENROUTER_API_KEY", "")
 elif model_name in {"google", "gemini"}:
-    model_key = os.getenv("GOOGLE_API_KEY", "")
+    model_key = os.getenv("PICOCLAW_RENDER_GOOGLE_API_KEY", "")
 
 security = {
     "model_list": {},
     "channels": {
         "telegram": {
-            "token": os.getenv("TELEGRAM_BOT_TOKEN", ""),
+            "token": os.getenv("PICOCLAW_RENDER_TELEGRAM_BOT_TOKEN", ""),
         },
     },
 }
@@ -607,9 +615,18 @@ for path in paths:
     path.write_text(json.dumps(payload, indent=2, sort_keys=False) + "\n", encoding="utf-8")
     path.chmod(0o600)
 PY
-  python3 /opt/firefly-picoclaw/bin/token_expiry_reminder.py &
+  TELEGRAM_BOT_TOKEN="${TELEGRAM_TOKEN}" python3 /opt/firefly-picoclaw/bin/token_expiry_reminder.py &
   if [[ "${TELEGRAM_ENABLED}" == "true" ]]; then
-    python3 /opt/firefly-picoclaw/bin/telegram_firefly_bot.py &
+    (
+      export TELEGRAM_BOT_TOKEN="${TELEGRAM_TOKEN}"
+      export PDFAPIHUB_API_KEY="${PDFAPIHUB_TOKEN}"
+      export OPENAI_API_KEY="${OPENAI_TOKEN}"
+      export ANTHROPIC_API_KEY="${ANTHROPIC_TOKEN}"
+      export OPENROUTER_API_KEY="${OPENROUTER_TOKEN}"
+      export GROQ_API_KEY="${GROQ_TOKEN}"
+      export GOOGLE_API_KEY="${GOOGLE_TOKEN}"
+      python3 /opt/firefly-picoclaw/bin/telegram_firefly_bot.py
+    ) &
   fi
 fi
 
@@ -688,6 +705,7 @@ if [[ "$1" == "picoclaw" ]]; then
   # Newer PicoClaw maps exported FOO_BAR secrets back into flat config fields
   # before strict decoding. Secrets are already in .security.yml at this point.
   unset_picoclaw_flat_secret_env
+  unset_picoclaw_render_secret_env
 fi
 
 exec "$@"
