@@ -11,7 +11,7 @@ BIN_ROOT="${BIN_ROOT:-/opt/firefly-picoclaw/bin}"
 RUNTIME_PORT="${PICOCLAW_PORT:-18790}"
 RUNTIME_HOST="${PICOCLAW_GATEWAY_HOST:-127.0.0.1}"
 VERIFY_ON_BOOT="${FIREFLY_RUNTIME_VERIFY_ON_BOOT:-true}"
-ENTRYPOINT_BUILD_MARKER="config-scrub-v5"
+ENTRYPOINT_BUILD_MARKER="config-scrub-v7"
 
 echo "firefly-picoclaw entrypoint ${ENTRYPOINT_BUILD_MARKER}" >&2
 
@@ -109,7 +109,7 @@ for p in config_paths:
             data = json.loads(p.read_text(encoding="utf-8"))
             if isinstance(data, dict):
                 cleaned = scrub(data)
-                p.write_text(json.dumps(cleaned, indent=2) + "\n", encoding="utf-8")
+                p.write_text(json.dumps(cleaned, indent=2, sort_keys=False) + "\n", encoding="utf-8")
                 p.chmod(0o600)
                 print(f"Scrubbed config {p} (phase={phase})")
         except Exception as e:
@@ -191,6 +191,21 @@ export PICOCLAW_RENDER_GROQ_API_KEY="${GROQ_TOKEN}"
 export PICOCLAW_RENDER_GOOGLE_API_KEY="${GOOGLE_TOKEN}"
 export PICOCLAW_RENDER_PDFAPIHUB_API_KEY="${PDFAPIHUB_TOKEN}"
 
+# Set defaults for Firefly environment variables used in MCP server
+export FIREFLY_BASE_URL="${FIREFLY_BASE_URL:-http://firefly:8080}"
+export FIREFLY_API_BASE_PATH="${FIREFLY_API_BASE_PATH:-/api/v1}"
+export FIREFLY_TIMEOUT_SECONDS="${FIREFLY_TIMEOUT_SECONDS:-15}"
+export FIREFLY_REQUEST_RETRIES="${FIREFLY_REQUEST_RETRIES:-2}"
+export FIREFLY_RETRY_BACKOFF_SECONDS="${FIREFLY_RETRY_BACKOFF_SECONDS:-0.5}"
+export FIREFLY_VERIFY_TLS="${FIREFLY_VERIFY_TLS:-true}"
+export FIREFLY_FORCE_CONNECTION_CLOSE="${FIREFLY_FORCE_CONNECTION_CLOSE:-true}"
+export FIREFLY_DEFAULT_DRY_RUN="${FIREFLY_DEFAULT_DRY_RUN:-true}"
+export FIREFLY_HIGH_VALUE_THRESHOLD="${FIREFLY_HIGH_VALUE_THRESHOLD:-250.00}"
+export FIREFLY_DEDUPE_WINDOW_DAYS="${FIREFLY_DEDUPE_WINDOW_DAYS:-7}"
+export FIREFLY_ALLOW_DELETE="${FIREFLY_ALLOW_DELETE:-false}"
+export FIREFLY_MAPPINGS_PATH="${FIREFLY_MAPPINGS_PATH:-${PICOCLAW_WORKSPACE}/config/mappings.yml}"
+export FIREFLY_POLICY_PATH="${FIREFLY_POLICY_PATH:-${PICOCLAW_WORKSPACE}/config/policy.yml}"
+
 # Generate dynamic config files
 python3 <<'PY'
 import json, os, yaml
@@ -206,33 +221,84 @@ model_string = os.getenv("PICOCLAW_DEFAULT_MODEL", "gemini/gemini-2.5-flash")
 
 config = {
     "version": 2,
-    "agents": {"defaults": {"workspace": str(workspace), "model_name": model_name}},
+    "agents": {
+        "defaults": {
+            "workspace": str(workspace),
+            "restrict_to_workspace": True,
+            "model_name": model_name,
+            "max_tokens": 8192,
+            "context_window": 131072,
+            "temperature": 0.7,
+            "max_tool_iterations": 20,
+        }
+    },
     "model_list": [{"model_name": model_name, "model": model_string}],
-    "channels": {"telegram": {"enabled": True, "allow_from": [telegram_owner] if telegram_owner else []}},
+    "channels": {
+        "telegram": {
+            "enabled": True,
+            "allow_from": [telegram_owner] if telegram_owner else [],
+            "use_markdown_v2": False,
+            "streaming": {"enabled": True},
+        }
+    },
     "tools": {
-        "spawn": {"enabled": True}, "subagent": {"enabled": True}, "message": {"enabled": True},
-        "list_dir": {"enabled": True}, "read_file": {"enabled": True}, "write_file": {"enabled": True},
+        "spawn": {"enabled": True},
+        "subagent": {"enabled": True},
+        "message": {"enabled": True},
+        "list_dir": {"enabled": True},
+        "read_file": {"enabled": True, "mode": "bytes"},
+        "write_file": {"enabled": True},
         "edit_file": {"enabled": True},
+        "append_file": {"enabled": True},
+        "media_cleanup": {"enabled": True, "max_age_minutes": 30, "interval_minutes": 5},
         "mcp": {
             "enabled": True,
             "servers": {
                 "firefly-bridge": {
                     "enabled": True,
                     "command": "/opt/firefly-picoclaw/bin/firefly-bridge",
-                    "env": {k: os.getenv(k, "") for k in os.environ if k.startswith("FIREFLY_")}
+                    "env": {
+                        "FIREFLY_BASE_URL": os.getenv("FIREFLY_BASE_URL", ""),
+                        "FIREFLY_API_BASE_PATH": os.getenv("FIREFLY_API_BASE_PATH", ""),
+                        "FIREFLY_TIMEOUT_SECONDS": os.getenv("FIREFLY_TIMEOUT_SECONDS", ""),
+                        "FIREFLY_REQUEST_RETRIES": os.getenv("FIREFLY_REQUEST_RETRIES", ""),
+                        "FIREFLY_RETRY_BACKOFF_SECONDS": os.getenv("FIREFLY_RETRY_BACKOFF_SECONDS", ""),
+                        "FIREFLY_VERIFY_TLS": os.getenv("FIREFLY_VERIFY_TLS", ""),
+                        "FIREFLY_FORCE_CONNECTION_CLOSE": os.getenv("FIREFLY_FORCE_CONNECTION_CLOSE", ""),
+                        "FIREFLY_DEFAULT_DRY_RUN": os.getenv("FIREFLY_DEFAULT_DRY_RUN", ""),
+                        "FIREFLY_HIGH_VALUE_THRESHOLD": os.getenv("FIREFLY_HIGH_VALUE_THRESHOLD", ""),
+                        "FIREFLY_DEDUPE_WINDOW_DAYS": os.getenv("FIREFLY_DEDUPE_WINDOW_DAYS", ""),
+                        "FIREFLY_ALLOW_DELETE": os.getenv("FIREFLY_ALLOW_DELETE", ""),
+                        "FIREFLY_MAPPINGS_PATH": os.getenv("FIREFLY_MAPPINGS_PATH", ""),
+                        "FIREFLY_POLICY_PATH": os.getenv("FIREFLY_POLICY_PATH", ""),
+                        "FIREFLY_ACCESS_TOKEN_FILE": os.getenv("FIREFLY_ACCESS_TOKEN_FILE", ""),
+                    },
                 }
-            }
-        }
+            },
+        },
     },
+    "hooks": {"enabled": True},
+    "heartbeat": {"enabled": True, "interval": 30},
     "gateway": {"host": os.getenv("RUNTIME_HOST", "127.0.0.1"), "port": int(os.getenv("RUNTIME_PORT", "18790"))}
 }
-(config_dir / "config.json").write_text(json.dumps(config, indent=2) + "\n")
+(config_dir / "config.json").write_text(json.dumps(config, indent=2, sort_keys=False) + "\n")
 
+# Model key mapping
+model_key_env = f"PICOCLAW_RENDER_{model_name.upper()}_API_KEY"
+if model_name in {"gemini", "google"}:
+    model_key_env = "PICOCLAW_RENDER_GOOGLE_API_KEY"
+
+model_key = os.getenv(model_key_env, "")
 security = {
     "channels": {"telegram": {"token": os.getenv("PICOCLAW_RENDER_TELEGRAM_BOT_TOKEN", "")}},
-    "model_list": {model_name: {"api_keys": [os.getenv(f"PICOCLAW_RENDER_{model_name.upper()}_API_KEY", "")]}}
+    "model_list": {
+        model_name: {"api_keys": [model_key]} if model_key else {}
+    }
 }
-(config_dir / ".security.yml").write_text(yaml.safe_dump(security))
+if model_key:
+    security["model_list"][f"{model_name}:0"] = {"api_keys": [model_key]}
+
+(config_dir / ".security.yml").write_text(yaml.safe_dump(security, sort_keys=False))
 (security_dir / "firefly_access_token").write_text(os.getenv("FIREFLY_ACCESS_TOKEN", "") + "\n")
 PY
 
@@ -247,14 +313,18 @@ fi
 if [[ "$#" -eq 0 ]]; then set -- picoclaw gateway; fi
 
 if [[ "$1" == "picoclaw" && "${2:-}" == "gateway" ]]; then
-  TELEGRAM_BOT_TOKEN="${TELEGRAM_TOKEN}" python3 /opt/firefly-picoclaw/bin/token_expiry_reminder.py &
+  # Model keys for Python bots
+  export TELEGRAM_BOT_TOKEN="${TELEGRAM_TOKEN}"
+  export PDFAPIHUB_API_KEY="${PDFAPIHUB_TOKEN}"
+  export OPENAI_API_KEY="${OPENAI_TOKEN}"
+  export ANTHROPIC_API_KEY="${ANTHROPIC_TOKEN}"
+  export OPENROUTER_API_KEY="${OPENROUTER_TOKEN}"
+  export GROQ_API_KEY="${GROQ_TOKEN}"
+  export GOOGLE_API_KEY="${GOOGLE_TOKEN}"
+
+  python3 /opt/firefly-picoclaw/bin/token_expiry_reminder.py &
   if [[ "${TELEGRAM_ENABLED:-true}" == "true" ]]; then
-    (
-      export TELEGRAM_BOT_TOKEN="${TELEGRAM_TOKEN}"
-      export PDFAPIHUB_API_KEY="${PDFAPIHUB_TOKEN}"
-      export GOOGLE_API_KEY="${GOOGLE_TOKEN}"
-      python3 /opt/firefly-picoclaw/bin/telegram_firefly_bot.py
-    ) &
+    python3 /opt/firefly-picoclaw/bin/telegram_firefly_bot.py &
   fi
 fi
 
