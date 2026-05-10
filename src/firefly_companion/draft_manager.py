@@ -582,14 +582,34 @@ class DraftManager:
             it="Scrivi 'ok' per salvare, o 'annulla' per scartare.",
         ))
         lines.append(ctx.localized(
-            en="You can also say: 'change amount to X', 'change description to Y', 'change category', 'change from X', 'change to X', 'list accounts', 're-read'. Use /cancel to force-discard.",
-            it="Puoi anche dire: 'cambia importo a X', 'cambia descrizione a Y', 'cambia categoria', 'cambia da X', 'cambia a X', 'lista conti', 'rileggi'. Usa /cancel per scartare forzatamente.",
+            en="You can also say: 'change amount to X', 'change description to Y', 'change category', 'change type to income/expense', 'change budget to X', 'change from X', 'change to X', 'list accounts', 're-read'. Use /cancel to force-discard.",
+            it="Puoi anche dire: 'cambia importo a X', 'cambia descrizione a Y', 'cambia categoria', 'cambia tipo a entrata/spesa', 'cambia budget a X', 'cambia da X', 'cambia a X', 'lista conti', 'rileggi'. Usa /cancel per scartare forzatamente.",
         ))
         return "\n".join(lines)
 
     def _handle_review(self, session: DraftSession, lowered: str, ctx: ConversationContext) -> str:
-        # This phase just shows the review — actual commit/cancel is handled
-        # by the bot's control mode (has_commit_intent / has_cancel_intent).
+        # Detect correction-like inputs that bypassed is_correction
+        if any(word in lowered for word in {"cambia", "change", "modifica", "correggi", "aggiorna", "imposta"}):
+            return ctx.localized(
+                en=(
+                    "I didn't understand that correction. Try:\n"
+                    "  • 'change amount to X'\n"
+                    "  • 'change description to Y'\n"
+                    "  • 'change category'\n"
+                    "  • 'change type to income/expense'\n"
+                    "  • 'change budget to X'\n"
+                    "  • 'change from X' / 'change to X'"
+                ),
+                it=(
+                    "Non ho capito la correzione. Prova:\n"
+                    "  • 'cambia importo a X'\n"
+                    "  • 'cambia descrizione a Y'\n"
+                    "  • 'cambia categoria'\n"
+                    "  • 'cambia tipo a entrata/spesa'\n"
+                    "  • 'cambia budget a X'\n"
+                    "  • 'cambia da X' / 'cambia a X'"
+                ),
+            )
         return self.build_review_message(session)
 
     # ---- correction handling --------------------------------------------
@@ -677,6 +697,46 @@ class DraftManager:
                 draft.sync_payload()
                 return self.build_review_message(session)
 
+        # Change budget
+        budget_match = re.search(
+            r"(?:cambia|change|modifica|imposta|set)\s+budget\s+(?:a|to|in|=)?\s*(.+)",
+            lowered,
+        )
+        if budget_match:
+            new_budget = budget_match.group(1).strip().rstrip(".,!?")
+            if new_budget:
+                if new_budget in {"nessuno", "none", "no", "skip", "salta", "rimuovi", "remove"}:
+                    draft.budget_name = None
+                else:
+                    draft.budget_name = new_budget.title()
+                draft.budget_confirmed = True
+                draft.sync_payload()
+                return self.build_review_message(session)
+
+        # Change transaction type
+        type_match = re.search(
+            r"(?:cambia|change|modifica)\s+(?:tipo|type)\s+(?:a|to|in)\s+(\S+)",
+            lowered,
+        )
+        if type_match:
+            raw_type = type_match.group(1).strip().rstrip(".,!?")
+            type_map = {
+                "spesa": "withdrawal", "expense": "withdrawal", "withdrawal": "withdrawal",
+                "uscita": "withdrawal", "out": "withdrawal",
+                "entrata": "deposit", "income": "deposit", "deposit": "deposit",
+                "in": "deposit",
+                "trasferimento": "transfer", "transfer": "transfer",
+            }
+            new_type = type_map.get(raw_type)
+            if new_type:
+                draft.type = new_type
+                draft.sync_payload()
+                return self.build_review_message(session)
+            return ctx.localized(
+                en="Unknown type. Use: 'change type to income', 'change type to expense', or 'change type to transfer'.",
+                it="Tipo sconosciuto. Usa: 'cambia tipo a entrata', 'cambia tipo a spesa', o 'cambia tipo a trasferimento'.",
+            )
+
         # Request account list
         if any(phrase in lowered for phrase in {"lista conti", "conti disponibili", "list accounts", "show accounts", "quali conti"}):
             return "__LIST_ACCOUNTS__"
@@ -698,6 +758,7 @@ class DraftManager:
             "correggi", "fix", "sbagliato", "wrong", "not right",
             "lista conti", "conti disponibili", "list accounts", "quali conti",
             "descrizione", "description", "aggiorna",
+            "budget", "tipo", "type",
         }
         return any(marker in lowered for marker in correction_markers)
 

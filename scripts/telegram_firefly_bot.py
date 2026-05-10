@@ -3903,10 +3903,20 @@ def _extract_single_receipt_candidate(text: str | None, *, caption: str | None =
     )
 
 
+_RECEIPT_INCOME_KEYWORDS = frozenset({
+    "accredito", "bonifico ricevuto", "salary", "stipendio", "received payment",
+    "entrata", "ricevuto", "pagamento ricevuto", "hai ricevuto", "ricevuta",
+    "bonifico in entrata", "accredito bonifico", "credited",
+})
+
+
 def extract_receipt_candidates(text: str | None, *, caption: str | None = None) -> list[dict[str, Any]]:
     source = "\n".join(part for part in [caption, text] if part).strip()
     if not source:
         return []
+
+    normalized_source = normalize_natural_text(source)
+    default_kind = "create_income" if any(kw in normalized_source for kw in _RECEIPT_INCOME_KEYWORDS) else "create_expense"
 
     transaction_date = None
     date_match = re.search(r"\b(\d{2}[./]\d{2}[./]\d{2,4})\b", source)
@@ -3916,7 +3926,7 @@ def extract_receipt_candidates(text: str | None, *, caption: str | None = None) 
     candidates: list[dict[str, Any]] = []
     seen: set[tuple[str, str, str]] = set()
 
-    def append_candidate(*, amount: str, merchant: str | None, source_hint: str | None, snippet: str, transaction_kind: str = "create_expense") -> None:
+    def append_candidate(*, amount: str, merchant: str | None, source_hint: str | None, snippet: str, transaction_kind: str | None = None) -> None:
         clean_amount = amount.replace(",", ".")
         clean_merchant = titlecase_merchant(merchant) if merchant else None
         key = (
@@ -3927,18 +3937,20 @@ def extract_receipt_candidates(text: str | None, *, caption: str | None = None) 
         if key in seen:
             return
         seen.add(key)
+        kind = transaction_kind if transaction_kind is not None else default_kind
         candidates.append(
             _build_receipt_candidate(
                 source=source,
                 amount=clean_amount,
                 merchant=clean_merchant,
-                transaction_kind=transaction_kind,
+                transaction_kind=kind,
                 transaction_date=transaction_date,
                 source_hint=source_hint,
                 note_snippet=snippet,
             )
         )
 
+    # 1. POS payment blocks (BPER / standard Italian bank notifications)
     for match in re.finditer(
         r"pagamento\s+pos(?:\s+di)?\s+(\d+(?:[.,]\d{1,2})?)\s*(?:eur|euro|€)?\s+(?:presso|at)\s+([^\n]+)",
         source,
@@ -3950,8 +3962,24 @@ def extract_receipt_candidates(text: str | None, *, caption: str | None = None) 
             merchant=match.group(2).strip(" ."),
             source_hint=detect_receipt_source_hint(snippet) or detect_receipt_source_hint(source),
             snippet=snippet,
+            transaction_kind="create_expense",
         )
 
+    # 2. Generic bank notification: "€X,XX [presso|at|-] Merchant" or "Merchant €X,XX"
+    for match in re.finditer(
+        r"(?:€|EUR)\s*(\d+(?:[.,]\d{1,2})?)(?:\s*[-–]\s*|\s+(?:presso|at)\s+)([A-Za-zÀ-ÿ][^\n]{2,60})",
+        source,
+        re.IGNORECASE,
+    ):
+        snippet = match.group(0)
+        append_candidate(
+            amount=match.group(1),
+            merchant=match.group(2).strip(" .-"),
+            source_hint=detect_receipt_source_hint(source),
+            snippet=snippet,
+        )
+
+    # 3. Revolut blocks
     revolut_blocks = re.finditer(
         r"revolut[\s:,-]*([^\n€]{2,80}?)\s+(\d+(?:[.,]\d{1,2})?)\s*(?:eur|euro|€)",
         source,
@@ -3966,11 +3994,19 @@ def extract_receipt_candidates(text: str | None, *, caption: str | None = None) 
             snippet=snippet,
         )
 
+    # 4. Generic EUR amount lines (amount followed by EUR/€, OR € followed by amount)
     if not candidates:
         lines = [line.strip() for line in source.splitlines() if line.strip()]
         for index, line in enumerate(lines):
-            amount_match = re.search(r"(\d+(?:[.,]\d{1,2})?)\s*(?:eur|euro|€)\b", line, re.IGNORECASE)
+            amount_match = re.search(
+                r"(\d+(?:[.,]\d{1,2})?)\s*(?:eur|euro|€)\b|(?:€|eur(?:o)?)\s*(\d+(?:[.,]\d{1,2})?)",
+                line,
+                re.IGNORECASE,
+            )
             if not amount_match:
+                continue
+            raw_amount = amount_match.group(1) or amount_match.group(2)
+            if not raw_amount:
                 continue
             nearby = "\n".join(lines[max(index - 2, 0) : min(index + 2, len(lines))])
             source_hint = detect_receipt_source_hint(nearby) or detect_receipt_source_hint(source)
@@ -3985,7 +4021,7 @@ def extract_receipt_candidates(text: str | None, *, caption: str | None = None) 
             if merchant and source_hint and normalize_natural_text(merchant) == normalize_natural_text(source_hint):
                 merchant = lines[index - 1] if index > 0 else merchant
             if merchant:
-                append_candidate(amount=amount_match.group(1), merchant=merchant, source_hint=source_hint, snippet=nearby)
+                append_candidate(amount=raw_amount, merchant=merchant, source_hint=source_hint, snippet=nearby)
 
     if candidates:
         return candidates
@@ -5786,7 +5822,46 @@ def process_receipt_message(service: BridgeService, bot_token: str, message: dic
         elif payload is None and fallback_payload is not None:
             payload = fallback_payload
     if payload is None:
-        return BotResponse(bot_text("receipt_unreadable", source_text=caption or extracted_text))
+        locale_src = caption or (extracted_text[:200] if extracted_text else None)
+        # Best-effort: try to extract at least an amount and create a partial draft
+        if extracted_text or caption:
+            raw_text = extracted_text or caption or ""
+            amt_match = re.search(
+                r"(?:€|eur(?:o)?)\s*(\d+(?:[.,]\d{1,2})?)|(\d+(?:[.,]\d{1,2})?)\s*(?:€|eur(?:o)?)",
+                raw_text,
+                re.IGNORECASE,
+            )
+            if amt_match:
+                raw_amount = (amt_match.group(1) or amt_match.group(2) or "").replace(",", ".")
+                if raw_amount:
+                    partial_payload = {
+                        "intent": "create_expense",
+                        "confidence": 0.3,
+                        "source_text": locale_src,
+                        "params": {
+                            "amount": raw_amount,
+                            "description": localize("Payment", "Pagamento", source_text=locale_src),
+                            "date": None,
+                            "live": False,
+                        },
+                    }
+                    try:
+                        resp = execute_intent(service, partial_payload, state)
+                        prefix = localize(
+                            "⚠️ I could read the amount but not all details — please check and correct this draft:",
+                            "⚠️ Ho letto l'importo ma non tutti i dettagli — controlla e correggi questa bozza:",
+                            source_text=locale_src,
+                        )
+                        return BotResponse(f"{prefix}\n\n{resp.text}")
+                    except Exception:
+                        pass
+            # No amount either — ask specifically
+            return BotResponse(localize(
+                "I could see text but couldn't find an amount. What was the total?",
+                "Ho visto del testo ma non sono riuscito a leggere l'importo. Qual era il totale?",
+                source_text=locale_src,
+            ))
+        return BotResponse(bot_text("receipt_unreadable", source_text=locale_src))
     response = execute_intent(service, payload, state)
     if visible_count > 1:
         counting_line = bot_text("receipt_counting", source_text=caption or extracted_text, count=visible_count)
@@ -6818,7 +6893,8 @@ def main() -> int:
         log.info(f"Cleaned {cleaned_count} orphaned drafts on startup")
         save_state(state)
     offset = int(state.get("offset", 0))
-    initialized = bool(state.get("initialized", False))
+    # Always flush pending messages on startup to avoid processing stale requests.
+    initialized = False
     if STARTUP_HEALTHCHECK_ENABLED:
         try:
             send_message(bot_token, target_id, build_health_message(service, source_text=configured_chat_language(), prefix_key="startup_ok"))
