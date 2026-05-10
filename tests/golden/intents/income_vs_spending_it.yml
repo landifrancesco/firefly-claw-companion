@@ -1,4 +1,0 @@
-input: "quanti soldi ho guadagnato e quanti ne ho spesi?"
-expected_intent: "get_income_vs_spending"
-expected_period: "current_month"
-

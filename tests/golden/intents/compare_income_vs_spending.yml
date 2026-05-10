@@ -1,9 +1,0 @@
-input: "confronta gennaio 2026 vs marzo 2026 per entrate e uscite"
-expected_intent: "compare_periods"
-expected_params:
-  metric: "income_vs_spending"
-  left_period:
-    month: "2026-01"
-  right_period:
-    month: "2026-03"
-

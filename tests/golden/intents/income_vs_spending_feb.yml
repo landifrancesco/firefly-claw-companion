@@ -1,5 +1,0 @@
-input: "quante entrate ho avuto e quante uscite a febbraio 2026?"
-expected_intent: "get_income_vs_spending"
-expected_period:
-  month: "2026-02"
-

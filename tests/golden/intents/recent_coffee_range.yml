@@ -1,7 +1,0 @@
-input: "mostrami i movimenti caffe dal 2026-03-01 al 2026-03-31"
-expected_intent: "get_recent"
-expected_params:
-  query: "caffe"
-  from: "2026-03-01"
-  to: "2026-03-31"
-

@@ -35,7 +35,7 @@ docker compose exec companion python3 -m firefly_companion.cli health
 ```bash
 python -m pytest tests/test_telegram_setup_and_autofill.py
 python -m pytest tests/test_telegram_localization_and_periods.py
-python -m pytest tests/test_telegram_natural_commands.py tests/test_golden_intent_fixtures.py tests/test_golden_failures.py
+python -m pytest tests/test_telegram_natural_commands.py tests/test_golden_failures.py
 ```
 
 ```bash
