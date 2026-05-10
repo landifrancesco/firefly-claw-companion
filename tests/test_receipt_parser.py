@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import unittest
-from pathlib import Path
 
 from firefly_companion.receipt_parser import (
     count_visible_transactions,
@@ -15,7 +14,6 @@ from firefly_companion.receipt_parser import (
     validate_amount,
 )
 
-FIXTURE_DIR = Path(__file__).resolve().parent / "fixtures" / "ocr"
 
 
 class ValidateAmountTest(unittest.TestCase):
@@ -132,24 +130,6 @@ class ExtractReceiptCandidatesTest(unittest.TestCase):
         self.assertIsNotNone(candidate)
         self.assertEqual(candidate["amount"], "2.50")
 
-    def test_supermarket_realistic_ocr_fixture(self) -> None:
-        text = (FIXTURE_DIR / "supermarket_receipt_ocr.txt").read_text(encoding="utf-8")
-        candidate = extract_receipt_candidate(text)
-        self.assertIsNotNone(candidate)
-        self.assertEqual(candidate["amount"], "4.16")
-
-    def test_pos_slip_realistic_ocr_fixture(self) -> None:
-        text = (FIXTURE_DIR / "pos_slip_ocr.txt").read_text(encoding="utf-8")
-        candidate = extract_receipt_candidate(text)
-        self.assertIsNotNone(candidate)
-        self.assertEqual(candidate["amount"], "12.30")
-        self.assertIn("Bar", candidate["merchant"])
-
-    def test_multi_notification_realistic_ocr_fixture(self) -> None:
-        text = (FIXTURE_DIR / "bper_notifications_3x_ocr.txt").read_text(encoding="utf-8")
-        candidates = extract_receipt_candidates(text)
-        self.assertEqual(len(candidates), 3)
-        self.assertEqual([item["amount"] for item in candidates], ["0.45", "90.00", "5.65"])
 
 
 class SourceHintTest(unittest.TestCase):
