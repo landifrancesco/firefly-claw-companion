@@ -283,7 +283,12 @@ def seed_picoclaw_config(env_values: dict[str, str], telegram_token: str, firefl
                             "FIREFLY_BASE_URL": env_values["FIREFLY_BASE_URL"],
                             "FIREFLY_API_BASE_PATH": env_values["FIREFLY_API_BASE_PATH"],
                             "FIREFLY_TIMEOUT_SECONDS": env_values["FIREFLY_TIMEOUT_SECONDS"],
+                            "FIREFLY_REQUEST_RETRIES": env_values.get("FIREFLY_REQUEST_RETRIES", "2"),
+                            "FIREFLY_RETRY_BACKOFF_SECONDS": env_values.get("FIREFLY_RETRY_BACKOFF_SECONDS", "0.5"),
                             "FIREFLY_VERIFY_TLS": env_values["FIREFLY_VERIFY_TLS"],
+                            "FIREFLY_FORCE_CONNECTION_CLOSE": env_values.get(
+                                "FIREFLY_FORCE_CONNECTION_CLOSE", "true"
+                            ),
                             "FIREFLY_DEFAULT_DRY_RUN": env_values["FIREFLY_DEFAULT_DRY_RUN"],
                             "FIREFLY_HIGH_VALUE_THRESHOLD": env_values["FIREFLY_HIGH_VALUE_THRESHOLD"],
                             "FIREFLY_DEDUPE_WINDOW_DAYS": env_values["FIREFLY_DEDUPE_WINDOW_DAYS"],

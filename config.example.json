@@ -14,8 +14,7 @@
   "model_list": [
     {
       "model_name": "gemini",
-      "model": "gemini/gemini-2.5-flash",
-      "enabled": true
+      "model": "gemini/gemini-2.5-flash"
     }
   ],
   "channels": {
