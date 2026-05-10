@@ -11,7 +11,7 @@ BIN_ROOT="${BIN_ROOT:-/opt/firefly-picoclaw/bin}"
 RUNTIME_PORT="${PICOCLAW_PORT:-18790}"
 RUNTIME_HOST="${PICOCLAW_GATEWAY_HOST:-127.0.0.1}"
 VERIFY_ON_BOOT="${FIREFLY_RUNTIME_VERIFY_ON_BOOT:-true}"
-ENTRYPOINT_BUILD_MARKER="config-scrub-v2"
+ENTRYPOINT_BUILD_MARKER="config-scrub-v3"
 
 echo "firefly-picoclaw entrypoint ${ENTRYPOINT_BUILD_MARKER}" >&2
 
@@ -127,6 +127,79 @@ for path in paths:
     path.chmod(0o600)
     top_level = sorted(cleaned) if isinstance(cleaned, dict) else []
     print(f"scrub_picoclaw_config phase={phase} path={path} keys={top_level}", flush=True)
+PY
+}
+
+# PicoClaw merges .security.yml into the same map as config.json before decode.
+# Legacy flat secret keys in either file therefore surface as "unknown fields".
+scrub_picoclaw_security_yml() {
+  local phase="${1:-manual}"
+  python3 - "${phase}" <<'PY'
+from __future__ import annotations
+
+import os
+import sys
+from pathlib import Path
+
+import yaml
+
+phase = sys.argv[1]
+
+forbidden = {
+    "telegram_bot_token",
+    "openai_api_key",
+    "anthropic_api_key",
+    "openrouter_api_key",
+    "groq_api_key",
+    "google_api_key",
+    "pdfapihub_api_key",
+}
+
+
+def scrub(value):
+    if isinstance(value, dict):
+        return {key: scrub(item) for key, item in value.items() if key not in forbidden}
+    if isinstance(value, list):
+        return [scrub(item) for item in value]
+    return value
+
+
+def find_forbidden(value, path="$"):
+    matches = []
+    if isinstance(value, dict):
+        for key, item in value.items():
+            current = f"{path}.{key}"
+            if key in forbidden:
+                matches.append(current)
+            matches.extend(find_forbidden(item, current))
+    elif isinstance(value, list):
+        for index, item in enumerate(value):
+            matches.extend(find_forbidden(item, f"{path}[{index}]"))
+    return matches
+
+
+paths = [
+    Path(os.getenv("PICOCLAW_CONFIG_DIR", "/home/picoclaw/.picoclaw")) / ".security.yml",
+    Path(os.getenv("PICOCLAW_HOME", "/home/picoclaw")) / ".security.yml",
+]
+
+for path in paths:
+    if not path.exists():
+        continue
+    raw = path.read_text(encoding="utf-8")
+    data = yaml.safe_load(raw)
+    if data is None:
+        continue
+    if not isinstance(data, dict):
+        continue
+    cleaned = scrub(data)
+    remaining = find_forbidden(cleaned)
+    if remaining:
+        raise SystemExit(f"{path} still contains forbidden security keys after scrub: {remaining}")
+    path.write_text(yaml.safe_dump(cleaned, sort_keys=False), encoding="utf-8")
+    path.chmod(0o600)
+    top_level = sorted(cleaned)
+    print(f"scrub_picoclaw_security_yml phase={phase} path={path} keys={top_level}", flush=True)
 PY
 }
 
@@ -390,6 +463,7 @@ cp "${PICOCLAW_CONFIG_DIR}/config.json" "${PICOCLAW_HOME}/config.json"
 cp "${PICOCLAW_CONFIG_DIR}/.security.yml" "${PICOCLAW_HOME}/.security.yml"
 chmod 0600 "${PICOCLAW_HOME}/config.json" "${PICOCLAW_HOME}/.security.yml"
 scrub_picoclaw_config "before-migration"
+scrub_picoclaw_security_yml "before-migration"
 
 # Older companion builds accidentally allowed flat secret keys to survive in
 # config.json. Newer PicoClaw rejects those keys before migration, so clean both
@@ -533,6 +607,10 @@ if [[ -f "${PICOCLAW_CONFIG_DIR}/config.json" ]]; then
   cp "${PICOCLAW_CONFIG_DIR}/config.json" "${PICOCLAW_HOME}/config.json"
   chmod 0600 "${PICOCLAW_HOME}/config.json"
 fi
+if [[ -f "${PICOCLAW_CONFIG_DIR}/.security.yml" ]]; then
+  cp "${PICOCLAW_CONFIG_DIR}/.security.yml" "${PICOCLAW_HOME}/.security.yml"
+  chmod 0600 "${PICOCLAW_HOME}/.security.yml"
+fi
 scrub_picoclaw_config "before-exec"
 
 python3 <<'PY'
@@ -593,5 +671,7 @@ for path in paths:
     top_level = sorted(cleaned) if isinstance(cleaned, dict) else []
     print(f"Sanitized PicoClaw config before startup: {path} keys={top_level}", flush=True)
 PY
+
+scrub_picoclaw_security_yml "before-exec"
 
 exec "$@"
