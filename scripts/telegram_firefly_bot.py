@@ -5754,14 +5754,19 @@ def format_recent_transaction_picker_lines(
     records: list[dict[str, Any]],
     *,
     source_text: str | None = None,
+    intro: str | None = None,
 ) -> list[str]:
-    lines = [
-        localize(
-            "Choose a transaction by number:",
-            "Scegli una transazione con il numero:",
-            source_text=source_text,
+    lines: list[str] = []
+    if intro:
+        lines.append(intro)
+    else:
+        lines.append(
+            localize(
+                "Choose a transaction by number:",
+                "Scegli una transazione con il numero:",
+                source_text=source_text,
+            )
         )
-    ]
     for index, record in enumerate(records, 1):
         emoji = _PICKER_EMOJI_NUMBERS[index - 1] if index - 1 < len(_PICKER_EMOJI_NUMBERS) else f"{index}."
         description = str(record.get("description") or "—").strip()[:40]
@@ -5921,6 +5926,317 @@ _SPLIT_PATTERN = re.compile(
     """,
     re.IGNORECASE | re.VERBOSE,
 )
+_SPLIT_HINT_STOPWORDS = {
+    "per",
+    "by",
+    "in",
+    "la",
+    "il",
+    "lo",
+    "le",
+    "i",
+    "gli",
+    "una",
+    "uno",
+    "un",
+    "the",
+    "that",
+    "this",
+    "quella",
+    "quello",
+    "questa",
+    "questo",
+    "transazione",
+    "transazioni",
+    "transaction",
+    "transactions",
+    "spesa",
+    "spese",
+    "expense",
+    "expenses",
+    "movimento",
+    "movimenti",
+    "dividi",
+    "dividila",
+    "dividila",
+    "split",
+    "divide",
+    "ultima",
+    "ultimo",
+    "last",
+    "latest",
+}
+
+
+def _split_transaction_hint(text: str) -> str | None:
+    lowered = normalize_natural_text(text)
+    lowered = _SPLIT_PATTERN.sub(" ", lowered)
+    lowered = _LAST_TXN_HINT_PATTERN.sub(" ", lowered)
+    lowered = re.sub(r"\b(?:per|by|in)\s+\d+(?:[.,]\d+)?\b", " ", lowered)
+    tokens = [token for token in lowered.split() if token and token not in _SPLIT_HINT_STOPWORDS and len(token) >= 3]
+    if not tokens:
+        return None
+    return " ".join(tokens)
+
+
+def _record_from_last_committed(last: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "journal_id": str(last.get("id") or "").strip(),
+        "description": str(last.get("description") or "—"),
+        "amount": str(last.get("amount") or ""),
+        "type": str(last.get("type") or "").strip() or None,
+    }
+
+
+def _records_matching_split_hint(records: list[dict[str, Any]], hint: str) -> list[dict[str, Any]]:
+    target = normalize_match_text(hint)
+    if not target:
+        return []
+    target_tokens = [token for token in target.split() if len(token) >= 3]
+    matches: list[dict[str, Any]] = []
+    for record in records:
+        haystack = normalize_match_text(
+            " ".join(
+                part
+                for part in [
+                    str(record.get("description") or ""),
+                    str(record.get("category_name") or ""),
+                    str(record.get("source_name") or ""),
+                    str(record.get("destination_name") or ""),
+                ]
+                if part
+            )
+        )
+        if not haystack:
+            continue
+        if target in haystack or any(token in haystack for token in target_tokens):
+            matches.append(record)
+    return matches
+
+
+def _queue_split_action_for_record(
+    state: dict[str, Any],
+    record: dict[str, Any],
+    *,
+    divisor: Decimal,
+    source_text: str | None = None,
+) -> BotResponse:
+    txn_id = _transaction_group_id(record)
+    if not txn_id:
+        return BotResponse(
+            localize(
+                "I couldn't retrieve the transaction ID.",
+                "Non sono riuscito a ottenere l'ID della transazione.",
+                source_text=source_text,
+            )
+        )
+    description = str(record.get("description") or "—")
+    tx_type = str(record.get("type") or "").strip()
+    try:
+        old_amount = Decimal(str(record.get("amount") or "0"))
+    except Exception:
+        old_amount = None
+    if old_amount is None or old_amount <= 0 or not tx_type:
+        return BotResponse(
+            localize(
+                "I couldn't read the transaction amount.",
+                "Non sono riuscito a leggere l'importo della transazione.",
+                source_text=source_text,
+            )
+        )
+
+    new_amount = (old_amount / divisor).quantize(Decimal("0.01"))
+    preview = format_pending_action_preview(
+        localize(
+            f"Transaction: {description}",
+            f"Transazione: {description}",
+            source_text=source_text,
+        ),
+        [
+            localize(
+                f"Current amount: {old_amount:.2f}€ → new amount: {new_amount:.2f}€",
+                f"Importo attuale: {old_amount:.2f}€ → nuovo importo: {new_amount:.2f}€",
+                source_text=source_text,
+            )
+        ],
+        localize("Confirm? (yes / no)", "Confermo? (si / no)", source_text=source_text),
+    )
+    remember_pending_action(
+        state,
+        kind="transaction_amount_split",
+        payload={
+            "txn_id": txn_id,
+            "description": description,
+            "old_amount": str(old_amount),
+            "new_amount": str(new_amount),
+            "tx_type": tx_type,
+        },
+        preview=preview,
+    )
+    return BotResponse(preview)
+
+
+def _start_split_selection_flow(
+    state: dict[str, Any],
+    records: list[dict[str, Any]],
+    *,
+    divisor: Decimal,
+    source_text: str | None = None,
+    intro: str | None = None,
+) -> BotResponse:
+    state["pending_split_selection"] = {
+        "records": records,
+        "divisor": str(divisor),
+    }
+    return BotResponse(
+        "\n".join(
+            format_recent_transaction_picker_lines(
+                records,
+                source_text=source_text,
+                intro=intro,
+            )
+        )
+    )
+
+
+def _start_split_latest_confirm_flow(
+    state: dict[str, Any],
+    latest: dict[str, Any],
+    records: list[dict[str, Any]],
+    *,
+    divisor: Decimal,
+    source_text: str | None = None,
+) -> BotResponse:
+    description = str(latest.get("description") or "—")
+    amount = format_money(latest.get("amount"))
+    state["pending_split_latest_confirm"] = {
+        "record": latest,
+        "records": records,
+        "divisor": str(divisor),
+    }
+    return BotResponse(
+        localize(
+            f"Latest Firefly transaction: {description} | {amount}.\nSplit that one? (yes / no)",
+            f"Ultima transazione in Firefly: {description} | {amount}.\nLa divido? (si / no)",
+            source_text=source_text,
+        )
+    )
+
+
+def handle_pending_split_latest_confirm(
+    service: BridgeService,
+    state: dict[str, Any],
+    text: str,
+) -> BotResponse | None:
+    pending = state.get("pending_split_latest_confirm")
+    if not isinstance(pending, dict) or text.strip().startswith("/"):
+        return None
+
+    if has_cancel_intent(text):
+        state.pop("pending_split_latest_confirm", None)
+        return BotResponse(localize("Split cancelled.", "Divisione annullata.", source_text=text))
+
+    try:
+        divisor = Decimal(str(pending.get("divisor") or "0").replace(",", "."))
+    except Exception:
+        divisor = Decimal("0")
+    if divisor <= 0:
+        state.pop("pending_split_latest_confirm", None)
+        return BotResponse(localize("Split action incomplete.", "Azione di divisione incompleta.", source_text=text))
+
+    if has_commit_intent(text):
+        record = pending.get("record")
+        state.pop("pending_split_latest_confirm", None)
+        if not isinstance(record, dict):
+            return BotResponse(localize("Split action incomplete.", "Azione di divisione incompleta.", source_text=text))
+        return _queue_split_action_for_record(state, record, divisor=divisor, source_text=text)
+
+    lowered = normalize_natural_text(text)
+    if lowered in {"no", "n", "nope", "non"}:
+        records = list(pending.get("records") or [])
+        state.pop("pending_split_latest_confirm", None)
+        if not records:
+            records = fetch_recent_transactions_for_picker(service)
+        if not records:
+            return BotResponse(
+                localize(
+                    "I couldn't find a recent transaction to split.",
+                    "Non ho trovato transazioni recenti da dividere.",
+                    source_text=text,
+                )
+            )
+        return _start_split_selection_flow(
+            state,
+            records,
+            divisor=divisor,
+            source_text=text,
+            intro=localize(
+                "Choose which transaction to split:",
+                "Scegli quale transazione dividere:",
+                source_text=text,
+            ),
+        )
+
+    return BotResponse(
+        localize(
+            "Reply yes to split the latest transaction, or no to choose from the list.",
+            "Rispondi si per dividere l'ultima transazione, oppure no per scegliere dalla lista.",
+            source_text=text,
+        )
+    )
+
+
+def handle_pending_split_selection(
+    service: BridgeService,
+    state: dict[str, Any],
+    text: str,
+) -> BotResponse | None:
+    pending = state.get("pending_split_selection")
+    if not isinstance(pending, dict) or text.strip().startswith("/"):
+        return None
+
+    if has_cancel_intent(text):
+        state.pop("pending_split_selection", None)
+        return BotResponse(localize("Split cancelled.", "Divisione annullata.", source_text=text))
+
+    records = list(pending.get("records") or [])
+    if not records:
+        state.pop("pending_split_selection", None)
+        return BotResponse(
+            localize(
+                "The split list expired. Try again.",
+                "La lista per la divisione e scaduta. Riprova.",
+                source_text=text,
+            )
+        )
+
+    try:
+        divisor = Decimal(str(pending.get("divisor") or "0").replace(",", "."))
+    except Exception:
+        divisor = Decimal("0")
+    if divisor <= 0:
+        state.pop("pending_split_selection", None)
+        return BotResponse(localize("Split action incomplete.", "Azione di divisione incompleta.", source_text=text))
+
+    choice = match_choice(text, [str(index) for index in range(1, len(records) + 1)])
+    if choice is None:
+        return BotResponse(
+            "\n".join(
+                format_recent_transaction_picker_lines(
+                    records,
+                    source_text=text,
+                    intro=localize(
+                        "Choose which transaction to split:",
+                        "Scegli quale transazione dividere:",
+                        source_text=text,
+                    ),
+                )
+            )
+        )
+
+    record = records[int(choice) - 1]
+    state.pop("pending_split_selection", None)
+    return _queue_split_action_for_record(state, record, divisor=divisor, source_text=text)
 
 
 def handle_split_transaction_intent(
@@ -5940,79 +6256,67 @@ def handle_split_transaction_intent(
     except Exception:
         return None
 
-    wants_firefly_latest = bool(_LAST_TXN_HINT_PATTERN.search(text))
-    rec: dict[str, Any] | None = None
-    if not wants_firefly_latest:
-        last = state.get("last_committed_txn")
-        if isinstance(last, dict) and last.get("id") and last.get("amount"):
-            rec = {
-                "journal_id": str(last.get("id") or "").strip(),
-                "description": str(last.get("description") or "—"),
-                "amount": str(last.get("amount") or ""),
-                "type": str(last.get("type") or "").strip() or None,
-            }
+    records = fetch_recent_transactions_for_picker(service)
+    if not records:
+        return BotResponse(
+            localize(
+                "I couldn't find a recent transaction to split.",
+                "Non ho trovato transazioni recenti da dividere.",
+                source_text=text,
+            )
+        )
 
-    if rec is None or wants_firefly_latest:
-        records = fetch_recent_transactions_for_picker(service, limit=1)
-        if not records:
-            return BotResponse(
-                localize(
-                    "I couldn't find a recent transaction to split.",
-                    "Non ho trovato transazioni recenti da dividere.",
+    wants_firefly_latest = bool(_LAST_TXN_HINT_PATTERN.search(text))
+    if wants_firefly_latest:
+        return _queue_split_action_for_record(state, records[0], divisor=divisor, source_text=text)
+
+    hint = _split_transaction_hint(text)
+    if hint:
+        matches = _records_matching_split_hint(records, hint)
+        latest_id = _transaction_group_id(records[0])
+        if len(matches) == 1 and _transaction_group_id(matches[0]) == latest_id:
+            return _queue_split_action_for_record(state, matches[0], divisor=divisor, source_text=text)
+        if matches:
+            picker_records = matches if len(matches) > 1 else records
+            intro = localize(
+                "Choose which transaction to split:",
+                "Scegli quale transazione dividere:",
+                source_text=text,
+            )
+            if len(matches) > 1:
+                intro = localize(
+                    f"I found {len(matches)} matching transactions. Choose which one to split:",
+                    f"Ho trovato {len(matches)} transazioni corrispondenti. Scegli quale dividere:",
                     source_text=text,
                 )
-            )
-        rec = records[0]
-
-    txn_id = _transaction_group_id(rec)
-    if not txn_id:
-        return BotResponse(
-            localize(
-                "I couldn't retrieve the transaction ID.",
-                "Non sono riuscito a ottenere l'ID della transazione.",
+            return _start_split_selection_flow(
+                state,
+                picker_records,
+                divisor=divisor,
                 source_text=text,
+                intro=intro,
             )
-        )
-    description = str(rec.get("description") or "—")
-    tx_type = str(rec.get("type") or "").strip()
-    try:
-        old_amount = Decimal(str(rec.get("amount") or "0"))
-    except Exception:
-        old_amount = None
-
-    if old_amount is None or old_amount <= 0 or not tx_type:
-        return BotResponse(
-            localize(
-                "I couldn't read the transaction amount.",
-                "Non sono riuscito a leggere l'importo della transazione.",
-                source_text=text,
-            )
-        )
-
-    new_amount = (old_amount / divisor).quantize(Decimal("0.01"))
-
-    preview = format_pending_action_preview(
-        localize(
-            f"Last transaction: {description}",
-            f"Ultima transazione: {description}",
+        return _start_split_selection_flow(
+            state,
+            records,
+            divisor=divisor,
             source_text=text,
-        ),
-        [
-            localize(
-                f"Current amount: {old_amount:.2f}€ → new amount: {new_amount:.2f}€",
-                f"Importo attuale: {old_amount:.2f}€ → nuovo importo: {new_amount:.2f}€",
+            intro=localize(
+                "I couldn't match that transaction. Choose which one to split:",
+                "Non ho trovato quella transazione. Scegli quale dividere:",
                 source_text=text,
-            )
-        ],
-        localize("Confirm? (yes / no)", "Confermo? (si / no)", source_text=text),
-    )
-    remember_pending_action(
-        state,
-        kind="transaction_amount_split",
-        payload={"txn_id": txn_id, "description": description, "old_amount": str(old_amount), "new_amount": str(new_amount), "tx_type": tx_type},
-        preview=preview,
-    )
-    return BotResponse(preview)
+            ),
+        )
+
+    last = state.get("last_committed_txn")
+    if isinstance(last, dict) and last.get("id") and last.get("amount"):
+        rec = _record_from_last_committed(last)
+        latest_id = _transaction_group_id(records[0])
+        if str(rec.get("journal_id") or "") == latest_id:
+            return _queue_split_action_for_record(state, rec, divisor=divisor, source_text=text)
+        return _start_split_latest_confirm_flow(state, records[0], records, divisor=divisor, source_text=text)
+
+    return _start_split_latest_confirm_flow(state, records[0], records, divisor=divisor, source_text=text)
 
 
 def parse_direct_write_sentence(service: BridgeService, text: str, state: dict[str, Any]) -> BotResponse | None:
@@ -6560,6 +6864,14 @@ def process_message(service: BridgeService, text: str, state: dict[str, Any]) ->
         if clone_response is not None:
             return clone_response
 
+        split_latest_response = handle_pending_split_latest_confirm(service, state, text)
+        if split_latest_response is not None:
+            return split_latest_response
+
+        split_selection_response = handle_pending_split_selection(service, state, text)
+        if split_selection_response is not None:
+            return split_selection_response
+
         if draft_session is not None and draft_session.is_active:
             manager = build_draft_manager(service)
             if has_cancel_intent(text):
@@ -6725,6 +7037,8 @@ def process_message(service: BridgeService, text: str, state: dict[str, Any]) ->
         state.pop("pending_recurrence_suggestion", None)
         state.pop("awaiting_recurrence_answer", None)
         state.pop("pending_clone_selection", None)
+        state.pop("pending_split_latest_confirm", None)
+        state.pop("pending_split_selection", None)
         state.pop("retry_queue", None)
         draft_session = load_draft_session(state)
         if draft_session is not None:

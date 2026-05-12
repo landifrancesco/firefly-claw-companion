@@ -163,6 +163,48 @@ class CloneAndSplitFlowTest(unittest.TestCase):
         self.assertIn("transaction updated", commit_response.text.lower())
         self.assertEqual(service.client.update_calls, [(42, {"type": "withdrawal", "amount": "3.00"})])
 
+    def test_split_without_latest_hint_asks_before_using_last_committed(self) -> None:
+        service = self._service()
+        state = {
+            "last_committed_txn": {
+                "id": "41",
+                "description": "Caffe",
+                "amount": "2.20",
+                "type": "withdrawal",
+            }
+        }
+
+        response = bot.process_message(service, "dividi per 2", state)
+
+        self.assertIn("Latest Firefly transaction", response.text)
+        self.assertIn("pending_split_latest_confirm", state)
+
+    def test_split_latest_confirm_no_shows_picker(self) -> None:
+        service = self._service()
+        state = {
+            "last_committed_txn": {
+                "id": "41",
+                "description": "Caffe",
+                "amount": "2.20",
+                "type": "withdrawal",
+            }
+        }
+
+        bot.process_message(service, "dividi per 2", state)
+        response = bot.process_message(service, "no", state)
+
+        self.assertIn("Choose which transaction to split", response.text)
+        self.assertIn("pending_split_selection", state)
+
+    def test_split_hint_for_older_transaction_opens_picker(self) -> None:
+        service = self._service()
+        state: dict[str, Any] = {}
+
+        response = bot.process_message(service, "dividi per 2 il caffe", state)
+
+        self.assertIn("Caffe", response.text)
+        self.assertIn("pending_split_selection", state)
+
     def test_clone_command_duplicates_selected_transaction_with_today_date(self) -> None:
         service = self._service()
         state: dict[str, Any] = {}
