@@ -62,6 +62,7 @@
       "/graph - balance, spending, and cashflow charts",
       "/setbudgetlimit budget=\"Groceries\" amount=350 month=2026-04",
       "/expense, /income, /transfer - direct transaction drafts with amount, description, source, destination, category, and budget",
+      "/clone - duplicate a recent transaction with today's date",
       "/newcategory, /newbudget, /newaccount - create Firefly reference items",
       "/backup - send a JSON backup to this chat",
       "/maintenance - cleanup mode for accounts, categories, and budgets",

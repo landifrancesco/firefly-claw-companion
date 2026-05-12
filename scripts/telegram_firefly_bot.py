@@ -748,6 +748,7 @@ COMMAND_ALIASES: dict[str, str] = {
     "/nuovacategoria": "/newcategory",
     "/nuovobudget":  "/newbudget",
     "/nuovoconto":   "/newaccount",
+    "/clona":        "/clone",
     "/stop":         "/cancel",
 }
 
@@ -1112,6 +1113,32 @@ def _merged_created_transaction(result: dict[str, Any], fallback_payload: dict[s
                 tx["description"] = attributes.get("group_title")
             return tx
     return dict(fallback_tx)
+
+
+def _transaction_group_id(record: dict[str, Any]) -> str:
+    return str(record.get("journal_id") or record.get("transaction_id") or "").strip()
+
+
+def _remember_last_committed_txn(
+    state: dict[str, Any],
+    created: dict[str, Any],
+    fallback_payload: dict[str, Any] | None = None,
+) -> None:
+    tx_data = _merged_created_transaction(created, fallback_payload)
+    group_id = ""
+    data = created.get("data") if isinstance(created, dict) else None
+    if isinstance(data, dict) and data.get("id") is not None:
+        group_id = str(data.get("id")).strip()
+    if not group_id:
+        group_id = _transaction_group_id(tx_data)
+    if not group_id:
+        return
+    state["last_committed_txn"] = {
+        "id": group_id,
+        "description": str(tx_data.get("description") or ""),
+        "amount": str(tx_data.get("amount") or ""),
+        "type": str(tx_data.get("type") or "").strip() or None,
+    }
 
 
 def _field_or_missing(value: Any, *, source_text: str | None = None) -> str:
@@ -2336,27 +2363,25 @@ def commit_pending_transaction(service: BridgeService, state: dict[str, Any], te
 
         save_draft_session(state, None)
         created = result.get("result", {})
-        # Remember the journal ID so the user can say "dividi per N" right after.
-        tx_data = _merged_created_transaction(created, payload)
-        _txn_id = tx_data.get("transaction_journal_id") or tx_data.get("transaction_id")
-        if _txn_id:
-            state["last_committed_txn"] = {
-                "id": str(_txn_id),
-                "description": str(tx_data.get("description") or ""),
-                "amount": str(tx_data.get("amount") or ""),
-            }
+        _remember_last_committed_txn(state, created, payload)
         return BotResponse(format_created_transaction_result(created, fallback_payload=payload, source_text=text))
 
     if kind == "transaction_amount_split":
         txn_id = str((payload or {}).get("txn_id") or "").strip()
         new_amount = str((payload or {}).get("new_amount") or "").strip()
         description = str((payload or {}).get("description") or "").strip()
-        if not txn_id or not new_amount:
+        tx_type = str((payload or {}).get("tx_type") or "").strip()
+        if not txn_id or not new_amount or not tx_type:
             clear_pending_action(state)
             return BotResponse(localize("Split action incomplete.", "Azione di divisione incompleta.", source_text=text))
-        if service.client.update_transaction(int(txn_id), {"amount": new_amount}):
+        if service.client.update_transaction(int(txn_id), {"type": tx_type, "amount": new_amount}):
             clear_pending_action(state)
-            state["last_committed_txn"] = {"id": txn_id, "description": description, "amount": new_amount}
+            state["last_committed_txn"] = {
+                "id": txn_id,
+                "description": description,
+                "amount": new_amount,
+                "type": tx_type,
+            }
             return BotResponse(
                 localize(
                     f"✅ Transaction updated.\n{description}: {new_amount} EUR",
@@ -5687,6 +5712,197 @@ def execute_intent(service: BridgeService, payload: dict[str, Any], state: dict[
 
 
 # ---------------------------------------------------------------------------
+# Recent transaction picker / clone / split
+# ---------------------------------------------------------------------------
+
+_RECENT_TXN_PICK_LIMIT = 10
+_PICKER_EMOJI_NUMBERS = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
+_LAST_TXN_HINT_PATTERN = re.compile(r"l['\u2019]?\s*ultima|ultima\s+transazione|last(?:est)?\s+transaction", re.IGNORECASE)
+_CLONE_REQUEST_PATTERN = re.compile(
+    r"\b(?:clone|clona|clonare|duplica|duplicare|copia|duplicate)\b",
+    re.IGNORECASE,
+)
+
+
+def fetch_recent_transactions_for_picker(
+    service: BridgeService,
+    *,
+    days: int = 90,
+    limit: int = _RECENT_TXN_PICK_LIMIT,
+) -> list[dict[str, Any]]:
+    try:
+        records = flatten_transactions(
+            service.client.list_transactions(
+                start=date.today() - timedelta(days=days),
+                end=date.today(),
+                limit=100,
+            )
+        )
+    except Exception:
+        return []
+    records.sort(
+        key=lambda item: (
+            str(item.get("date") or ""),
+            str(_transaction_group_id(item)),
+        ),
+        reverse=True,
+    )
+    return records[:limit]
+
+
+def format_recent_transaction_picker_lines(
+    records: list[dict[str, Any]],
+    *,
+    source_text: str | None = None,
+) -> list[str]:
+    lines = [
+        localize(
+            "Choose a transaction by number:",
+            "Scegli una transazione con il numero:",
+            source_text=source_text,
+        )
+    ]
+    for index, record in enumerate(records, 1):
+        emoji = _PICKER_EMOJI_NUMBERS[index - 1] if index - 1 < len(_PICKER_EMOJI_NUMBERS) else f"{index}."
+        description = str(record.get("description") or "—").strip()[:40]
+        amount = format_money(record.get("amount"))
+        date_label = format_display_date(str(record.get("date") or "")[:10])
+        category = str(record.get("category_name") or "").strip()
+        route = " → ".join(
+            part
+            for part in [
+                str(record.get("source_name") or "").strip(),
+                str(record.get("destination_name") or "").strip(),
+            ]
+            if part
+        )
+        details = " | ".join(
+            part
+            for part in [
+                date_label,
+                description,
+                amount,
+                category,
+                route,
+            ]
+            if part
+        )
+        lines.append(f"{emoji} {details}")
+    lines.append(
+        localize(
+            "Reply with the number, or /cancel to stop.",
+            "Rispondi con il numero, oppure /cancel per annullare.",
+            source_text=source_text,
+        )
+    )
+    return lines
+
+
+def start_clone_transaction_flow(
+    service: BridgeService,
+    state: dict[str, Any],
+    *,
+    source_text: str | None = None,
+) -> BotResponse:
+    records = fetch_recent_transactions_for_picker(service)
+    if not records:
+        return BotResponse(
+            localize(
+                "No recent transactions found to clone.",
+                "Nessuna transazione recente da clonare.",
+                source_text=source_text,
+            )
+        )
+    state["pending_clone_selection"] = {"records": records}
+    return BotResponse("\n".join(format_recent_transaction_picker_lines(records, source_text=source_text)))
+
+
+def duplicate_transaction_payload(
+    service: BridgeService,
+    record: dict[str, Any],
+    *,
+    target_date: date,
+) -> dict[str, Any]:
+    transaction_kind = str(record.get("type") or "withdrawal").strip()
+    return service.build_transaction(
+        transaction_kind=transaction_kind,
+        amount=str(record.get("amount") or "0"),
+        description=str(record.get("description") or ""),
+        transaction_date=target_date.isoformat(),
+        source_name=record.get("source_name"),
+        destination_name=record.get("destination_name"),
+        category_name=record.get("category_name"),
+        budget_name=record.get("budget_name"),
+        notes=record.get("notes"),
+        tags=None,
+        merchant=None,
+        currency_code=None,
+    )
+
+
+def handle_pending_clone_selection(
+    service: BridgeService,
+    state: dict[str, Any],
+    text: str,
+) -> BotResponse | None:
+    pending_clone = state.get("pending_clone_selection")
+    if not isinstance(pending_clone, dict) or text.strip().startswith("/"):
+        return None
+
+    if has_cancel_intent(text):
+        state.pop("pending_clone_selection", None)
+        return BotResponse(localize("Clone cancelled.", "Clonazione annullata.", source_text=text))
+
+    records = list(pending_clone.get("records") or [])
+    if not records:
+        state.pop("pending_clone_selection", None)
+        return BotResponse(
+            localize(
+                "The clone list expired. Try again.",
+                "La lista per la clonazione e scaduta. Riprova.",
+                source_text=text,
+            )
+        )
+
+    choice = match_choice(text, [str(index) for index in range(1, len(records) + 1)])
+    if choice is None:
+        return BotResponse("\n".join(format_recent_transaction_picker_lines(records, source_text=text)))
+
+    record = records[int(choice) - 1]
+    state.pop("pending_clone_selection", None)
+    payload = duplicate_transaction_payload(service, record, target_date=date.today())
+    try:
+        result = service.commit_transaction(payload, dry_run=False, confirm_high_value=True)
+    except (ConfigurationError, FireflyAPIError, ValueError, RuntimeError) as exc:
+        if is_firefly_offline_error(exc):
+            raise
+        return BotResponse(
+            localize(
+                f"Could not clone the transaction: {exc}",
+                f"Impossibile clonare la transazione: {exc}",
+                source_text=text,
+            )
+        )
+
+    if result["status"] == "duplicate_blocked":
+        return BotResponse(format_duplicate_blocked(result["duplicate"], source_text=text))
+
+    created = result.get("result", {})
+    _remember_last_committed_txn(state, created, payload)
+    return BotResponse(format_created_transaction_result(created, fallback_payload=payload, source_text=text))
+
+
+def handle_clone_transaction_intent(
+    service: BridgeService,
+    text: str,
+    state: dict[str, Any],
+) -> BotResponse | None:
+    if not _CLONE_REQUEST_PATTERN.search(text):
+        return None
+    return start_clone_transaction_flow(service, state, source_text=text)
+
+
+# ---------------------------------------------------------------------------
 # Split transaction intent
 # ---------------------------------------------------------------------------
 
@@ -5724,26 +5940,20 @@ def handle_split_transaction_intent(
     except Exception:
         return None
 
-    last = state.get("last_committed_txn")
-    if isinstance(last, dict) and last.get("id") and last.get("amount"):
-        txn_id = str(last["id"])
-        description = str(last.get("description") or "—")
-        try:
-            old_amount = Decimal(str(last["amount"]))
-        except Exception:
-            old_amount = None
-    else:
-        # Fetch latest transaction from Firefly.
-        try:
-            records = flatten_transactions(
-                service.client.list_transactions(
-                    start=date.today() - timedelta(days=30),
-                    end=date.today(),
-                    limit=1,
-                )
-            )
-        except Exception:
-            records = []
+    wants_firefly_latest = bool(_LAST_TXN_HINT_PATTERN.search(text))
+    rec: dict[str, Any] | None = None
+    if not wants_firefly_latest:
+        last = state.get("last_committed_txn")
+        if isinstance(last, dict) and last.get("id") and last.get("amount"):
+            rec = {
+                "journal_id": str(last.get("id") or "").strip(),
+                "description": str(last.get("description") or "—"),
+                "amount": str(last.get("amount") or ""),
+                "type": str(last.get("type") or "").strip() or None,
+            }
+
+    if rec is None or wants_firefly_latest:
+        records = fetch_recent_transactions_for_picker(service, limit=1)
         if not records:
             return BotResponse(
                 localize(
@@ -5753,22 +5963,24 @@ def handle_split_transaction_intent(
                 )
             )
         rec = records[0]
-        txn_id = str(rec.get("transaction_id") or rec.get("journal_id") or "")
-        if not txn_id:
-            return BotResponse(
-                localize(
-                    "I couldn't retrieve the transaction ID.",
-                    "Non sono riuscito a ottenere l'ID della transazione.",
-                    source_text=text,
-                )
-            )
-        description = str(rec.get("description") or "—")
-        try:
-            old_amount = Decimal(str(rec["amount"]))
-        except Exception:
-            old_amount = None
 
-    if old_amount is None or old_amount <= 0:
+    txn_id = _transaction_group_id(rec)
+    if not txn_id:
+        return BotResponse(
+            localize(
+                "I couldn't retrieve the transaction ID.",
+                "Non sono riuscito a ottenere l'ID della transazione.",
+                source_text=text,
+            )
+        )
+    description = str(rec.get("description") or "—")
+    tx_type = str(rec.get("type") or "").strip()
+    try:
+        old_amount = Decimal(str(rec.get("amount") or "0"))
+    except Exception:
+        old_amount = None
+
+    if old_amount is None or old_amount <= 0 or not tx_type:
         return BotResponse(
             localize(
                 "I couldn't read the transaction amount.",
@@ -5797,7 +6009,7 @@ def handle_split_transaction_intent(
     remember_pending_action(
         state,
         kind="transaction_amount_split",
-        payload={"txn_id": txn_id, "description": description, "old_amount": str(old_amount), "new_amount": str(new_amount)},
+        payload={"txn_id": txn_id, "description": description, "old_amount": str(old_amount), "new_amount": str(new_amount), "tx_type": tx_type},
         preview=preview,
     )
     return BotResponse(preview)
@@ -6344,6 +6556,10 @@ def process_message(service: BridgeService, text: str, state: dict[str, Any]) ->
         if has_commit_intent(text) and (draft_session is None or getattr(draft_session, "phase", None) == DraftPhase.REVIEW):
             return commit_pending_transaction(service, state, text)
 
+        clone_response = handle_pending_clone_selection(service, state, text)
+        if clone_response is not None:
+            return clone_response
+
         if draft_session is not None and draft_session.is_active:
             manager = build_draft_manager(service)
             if has_cancel_intent(text):
@@ -6404,6 +6620,10 @@ def process_message(service: BridgeService, text: str, state: dict[str, Any]) ->
                     )
                 )
             return BotResponse(advanced or manager.build_review_message(draft_session))
+
+        clone_response = handle_clone_transaction_intent(service, text, state)
+        if clone_response is not None:
+            return clone_response
 
         split_response = handle_split_transaction_intent(service, text, state)
         if split_response is not None:
@@ -6504,6 +6724,7 @@ def process_message(service: BridgeService, text: str, state: dict[str, Any]) ->
         state.pop("pending_transaction_resolution", None)
         state.pop("pending_recurrence_suggestion", None)
         state.pop("awaiting_recurrence_answer", None)
+        state.pop("pending_clone_selection", None)
         state.pop("retry_queue", None)
         draft_session = load_draft_session(state)
         if draft_session is not None:
@@ -6609,6 +6830,11 @@ def process_message(service: BridgeService, text: str, state: dict[str, Any]) ->
             return BotResponse(localize("Invalid transaction ID. Use: /delete <id>", "ID transazione non valido. Usa: /delete <id>", source_text=text))
         except Exception as exc:
             return BotResponse(f"Error: {exc}")
+
+    if command == "/clone":
+        if tail.strip():
+            return BotResponse(localize("Usage: /clone", "Uso: /clona", source_text=text))
+        return start_clone_transaction_flow(service, state, source_text=text)
 
     if command == "/edit":
         if not tail.strip():
@@ -6933,10 +7159,7 @@ def process_message(service: BridgeService, text: str, state: dict[str, Any]) ->
             return BotResponse(format_duplicate_blocked(result["duplicate"], source_text=text))
         created = result.get("result", {})
         clear_pending_transaction(state)
-        _tx_data = _merged_created_transaction(created, payload)
-        _tid = _tx_data.get("transaction_journal_id") or _tx_data.get("transaction_id")
-        if _tid:
-            state["last_committed_txn"] = {"id": str(_tid), "description": str(_tx_data.get("description") or ""), "amount": str(_tx_data.get("amount") or "")}
+        _remember_last_committed_txn(state, created, payload)
         return BotResponse(format_created_transaction_result(created, fallback_payload=payload, source_text=text))
 
     if command == "/newcategory":

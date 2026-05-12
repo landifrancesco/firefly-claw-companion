@@ -62,6 +62,7 @@
       "/grafico - grafici saldi, spese e flusso di cassa",
       "/impostabudget budget=\"Spesa\" amount=350 month=2026-04",
       "/spesa, /entrata, /trasferimento - bozze dirette con importo, descrizione, conto origine, conto destinazione, categoria e budget",
+      "/clona - duplica una transazione recente con la data di oggi",
       "/nuovacategoria, /nuovobudget, /nuovoconto - crea elementi di riferimento Firefly",
       "/esporta - invia un backup JSON in questa chat",
       "/manutenzione - pulizia di conti, categorie e budget",
