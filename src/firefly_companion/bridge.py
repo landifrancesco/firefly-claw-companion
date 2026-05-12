@@ -269,21 +269,6 @@ class BridgeService:
         )
 
     def find_duplicate(self, payload: dict[str, Any]) -> dict[str, Any] | None:
-        end = date.today()
-        start = end - timedelta(days=max(self.settings.dedupe_window_days, 1))
-        records = flatten_transactions(self.client.list_transactions(start=start, end=end, limit=100))
-        signature = payload["dedupe_signature"]
-        for record in records:
-            candidate = {
-                "type": str(record.get("type", "")),
-                "date": str(record.get("date", "")),
-                "amount": str(record.get("amount", "")),
-                "description": str(record.get("description", "")),
-                "source_name": str(record.get("source_name", "")),
-                "destination_name": str(record.get("destination_name", "")),
-            }
-            if dedupe_signature(candidate) == signature:
-                return record
         return None
 
     def commit_transaction(self, payload: dict[str, Any], *, dry_run: bool, confirm_high_value: bool) -> dict[str, Any]:
