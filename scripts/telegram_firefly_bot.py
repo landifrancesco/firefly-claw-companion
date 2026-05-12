@@ -2900,6 +2900,41 @@ def _recurrence_freq_label(freq: str, *, source_text: str | None = None) -> str:
     return _FREQ_LABEL_EN.get(freq, freq)
 
 
+def _build_recurrence_suggestion_prompt(
+    pending_recurrence_suggestion: dict[str, Any],
+    *,
+    source_text: str | None = None,
+) -> str:
+    cadence = str(pending_recurrence_suggestion.get("cadence") or "monthly")
+    transaction_kind = str(pending_recurrence_suggestion.get("transaction_kind") or "withdrawal")
+    freq_label = _recurrence_freq_label(cadence, source_text=source_text)
+    return localize(
+        f"This looks like a recurring {transaction_kind}: {freq_label}.\n"
+        "Want me to create a recurrence too? (yes/no)",
+        f"Sembra una transazione ricorrente: {freq_label}.\n"
+        "Vuoi creare anche una ricorrenza? (si/no)",
+        source_text=source_text,
+    )
+
+
+def _should_offer_recurrence_before_review(state: dict[str, Any], session: Any) -> bool:
+    if not isinstance(state.get("pending_recurrence_suggestion"), dict):
+        return False
+    if state.get("awaiting_recurrence_answer"):
+        return False
+    return getattr(session, "phase", None) == DraftPhase.REVIEW
+
+
+def _begin_recurrence_suggestion_prompt(
+    state: dict[str, Any],
+    pending_recurrence_suggestion: dict[str, Any],
+    *,
+    source_text: str | None = None,
+) -> str:
+    state["awaiting_recurrence_answer"] = True
+    return _build_recurrence_suggestion_prompt(pending_recurrence_suggestion, source_text=source_text)
+
+
 def _recurrence_type_label(tx_type: str, *, source_text: str | None = None) -> str:
     tx_type = (tx_type or "").strip().lower()
     if locale_language(source_text) == "it":
@@ -5515,13 +5550,13 @@ def execute_intent(service: BridgeService, payload: dict[str, Any], state: dict[
                 "budget": str(params.get("budget") or "").strip() or None,
                 "date": coerce_transaction_date(params.get("date")),
             }
-            freq_label = _recurrence_freq_label(recurrence_type, source_text=source_text)
-            response_text += "\n\n" + localize(
-                f"This looks like a recurring {transaction_kind}: {freq_label}.\n"
-                "Want me to create a recurrence too? (yes/no)",
-                f"Sembra una transazione ricorrente: {freq_label}.\n"
-                "Vuoi creare anche una ricorrenza? (si/no)",
-                source_text=source_text,
+        if _should_offer_recurrence_before_review(state, session):
+            return BotResponse(
+                _begin_recurrence_suggestion_prompt(
+                    state,
+                    state["pending_recurrence_suggestion"],
+                    source_text=source_text,
+                )
             )
         return BotResponse(response_text)
 
@@ -6151,12 +6186,29 @@ def process_message(service: BridgeService, text: str, state: dict[str, Any]) ->
     # Handle pending recurrence suggestion (yes/no after draft with recurrence keywords)
     pending_recurrence_suggestion = state.get("pending_recurrence_suggestion")
     if isinstance(pending_recurrence_suggestion, dict) and not text.strip().startswith("/"):
+        draft_session = load_draft_session(state)
+        if draft_session is not None and draft_session.is_active:
+            phase = getattr(draft_session, "phase", None)
+            if phase in {DraftPhase.CATEGORY_CONFIRM, DraftPhase.CATEGORY_SELECT, DraftPhase.BUDGET_SUGGEST}:
+                pending_recurrence_suggestion = None
+            elif phase == DraftPhase.REVIEW and not state.get("awaiting_recurrence_answer"):
+                pending_recurrence_suggestion = None
+    if isinstance(pending_recurrence_suggestion, dict) and not text.strip().startswith("/"):
         lowered_answer = normalize_natural_text(text)
         if has_cancel_intent(text) or any(w in lowered_answer for w in {"no", "nope", "nein", "non"}):
             state.pop("pending_recurrence_suggestion", None)
-            return BotResponse(localize("Got it, no recurrence created.", "Ok, nessuna ricorrenza creata.", source_text=text))
+            state.pop("awaiting_recurrence_answer", None)
+            review_text = ""
+            draft_session = load_draft_session(state)
+            if draft_session is not None and draft_session.is_active and getattr(draft_session, "phase", None) == DraftPhase.REVIEW:
+                review_text = build_draft_manager(service).build_review_message(draft_session)
+            response_text = localize("Got it, no recurrence created.", "Ok, nessuna ricorrenza creata.", source_text=text)
+            if review_text:
+                response_text = f"{response_text}\n\n{review_text}"
+            return BotResponse(response_text)
         if any(w in lowered_answer for w in {"yes", "si", "sì", "ok", "sure", "vai", "crea", "create"}):
             state.pop("pending_recurrence_suggestion", None)
+            state.pop("awaiting_recurrence_answer", None)
             cadence = str(pending_recurrence_suggestion.get("cadence") or "monthly")
             rec_params = {
                 "amount": str(pending_recurrence_suggestion.get("amount") or ""),
@@ -6343,6 +6395,14 @@ def process_message(service: BridgeService, text: str, state: dict[str, Any]) ->
 
             advanced = manager.advance(draft_session, text)
             save_draft_session(state, draft_session)
+            if _should_offer_recurrence_before_review(state, draft_session):
+                return BotResponse(
+                    _begin_recurrence_suggestion_prompt(
+                        state,
+                        state["pending_recurrence_suggestion"],
+                        source_text=text,
+                    )
+                )
             return BotResponse(advanced or manager.build_review_message(draft_session))
 
         split_response = handle_split_transaction_intent(service, text, state)
@@ -6443,6 +6503,7 @@ def process_message(service: BridgeService, text: str, state: dict[str, Any]) ->
         state.pop("pending_draft_account_fix", None)
         state.pop("pending_transaction_resolution", None)
         state.pop("pending_recurrence_suggestion", None)
+        state.pop("awaiting_recurrence_answer", None)
         state.pop("retry_queue", None)
         draft_session = load_draft_session(state)
         if draft_session is not None:
