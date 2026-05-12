@@ -5912,19 +5912,9 @@ def handle_clone_transaction_intent(
 # ---------------------------------------------------------------------------
 
 _SPLIT_PATTERN = re.compile(
-    r"""
-    (?:
-        divid[ia](?:la|lo|le)?   # dividi / dividila / dividilo
-        | split(?:\s+it)?
-        | divide(?:\s+it)?
-    )
-    (?:\s+(?:quella\s+di\s+\S+\s+(?:al?\s+)?\S+\s+)?(?:l['']ultima\s+)?)?
-    \s+
-    (?:per|by|in)
-    \s+
-    (\d+(?:[.,]\d+)?)            # group 1: divisor
-    """,
-    re.IGNORECASE | re.VERBOSE,
+    r"\b(?:divid[ia](?:la|lo|le)?|split(?:\s+it)?|divide(?:\s+it)?)\b"
+    r"(?:\s+[\w']+){0,8}?\s+(?:per|by|in)\s+(\d+(?:[.,]\d+)?)\b",
+    re.IGNORECASE,
 )
 _SPLIT_HINT_STOPWORDS = {
     "per",
@@ -6872,6 +6862,10 @@ def process_message(service: BridgeService, text: str, state: dict[str, Any]) ->
         if split_selection_response is not None:
             return split_selection_response
 
+        split_response = handle_split_transaction_intent(service, text, state)
+        if split_response is not None:
+            return split_response
+
         if draft_session is not None and draft_session.is_active:
             manager = build_draft_manager(service)
             if has_cancel_intent(text):
@@ -6936,10 +6930,6 @@ def process_message(service: BridgeService, text: str, state: dict[str, Any]) ->
         clone_response = handle_clone_transaction_intent(service, text, state)
         if clone_response is not None:
             return clone_response
-
-        split_response = handle_split_transaction_intent(service, text, state)
-        if split_response is not None:
-            return split_response
 
         direct_write = parse_direct_write_sentence(service, text, state)
         if direct_write is not None:

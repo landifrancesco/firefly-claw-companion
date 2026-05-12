@@ -163,6 +163,15 @@ class CloneAndSplitFlowTest(unittest.TestCase):
         self.assertIn("transaction updated", commit_response.text.lower())
         self.assertEqual(service.client.update_calls, [(42, {"type": "withdrawal", "amount": "3.00"})])
 
+    def test_split_last_transaction_phrase_in_english(self) -> None:
+        service = self._service()
+        state: dict[str, Any] = {}
+
+        response = bot.process_message(service, "split the last transaction by 2", state)
+
+        self.assertIn("Ristorante", response.text)
+        self.assertIn("pending_action", state)
+
     def test_split_without_latest_hint_asks_before_using_last_committed(self) -> None:
         service = self._service()
         state = {

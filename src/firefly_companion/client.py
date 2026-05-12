@@ -266,8 +266,21 @@ class FireflyClient:
     def update_transaction(self, transaction_id: int, updates: dict[str, Any]) -> bool:
         """Update transaction fields (amount, date, category, etc). Returns True if successful."""
         try:
-            payload = {"transactions": [updates]}
-            response = self._request("PUT", f"transactions/{transaction_id}", json_body=payload)
+            response = self._request("GET", f"transactions/{transaction_id}")
+            data = response.get("data") if isinstance(response, dict) else None
+            if not isinstance(data, dict):
+                return False
+            attributes = data.get("attributes", {})
+            transactions = attributes.get("transactions")
+            if not isinstance(transactions, list) or not transactions or not isinstance(transactions[0], dict):
+                return False
+            merged = dict(transactions[0])
+            merged.update(updates)
+            self._request(
+                "PUT",
+                f"transactions/{transaction_id}",
+                json_body={"transactions": [merged]},
+            )
             return True
         except Exception:
             return False
